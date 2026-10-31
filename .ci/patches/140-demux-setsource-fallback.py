@@ -31,4 +31,3 @@ else:
     raise SystemExit('demux.cpp setSourceFrontend anchor not found - upstream changed, review needed')
 open(p, 'w').write(s)
 print('demux.cpp setSourceFrontend fallback patched')
-

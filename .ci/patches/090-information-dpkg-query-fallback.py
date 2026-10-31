@@ -26,4 +26,3 @@ elif 'dpkg-query' in s:
 else:
     raise SystemExit('Information.py opkg anchor not found - upstream changed, review needed')
 print('Information.py opkg->dpkg-query fallback patched')
-

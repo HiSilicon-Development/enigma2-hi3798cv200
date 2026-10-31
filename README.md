@@ -1,74 +1,82 @@
 # enigma2-hi3798cv200
 
-将 [openatv/enigma2](https://github.com/openatv/enigma2)（OpenATV 8.0）移植到
-HiSilicon **Hi3798CV200**（DVBIP-1002 板）+ **Debian 12 (bookworm) arm64**。
+将 [openatv/enigma2](https://github.com/openatv/enigma2)（OpenATV 8.0 GUI）移植到
+HiSilicon **Hi3798CV200 / DVBIP** 的 Debian arm64 应用构建工程。
 
-所有编译均在 GitHub Actions 公开仓库的 **ubuntu-24.04-arm 原生 arm64 runner** 上完成，
-本地不需要交叉工具链。
+Enigma2 应用包不包含内核、hivxe-ffmpeg 或内核解码固件；已有的这些组件不应被应用安装覆盖。
+CI 使用 `ubuntu-24.04-arm` 原生 runner，分别在 Debian 12 / 13 容器中构建；两个发行版的
+系统库 ABI 不同，必须选用对应的 `~deb12` / `~deb13` 成品。
 
 ## 工作流
 
 | Workflow | 内容 | 产物 |
 |---|---|---|
 | `kernel-dvbip1002` | `HiSilicon-Development/linux-6.12.y`，`hi3798cv200_defconfig` 基座 + `dvbip_1002_defconfig` 片段（merge_config.sh 合并） | `linux-image-*.deb`、`linux-headers-*.deb`、`linux-libc-dev-*.deb` |
-| `enigma2-debian12-arm64` | openatv/enigma2 master + Debian 12 原生构建 | `enigma2-hi3798cv200_*.deb`、`libdvbsi++_*.deb`、`libtuxtxt_*.deb` |
-
-触发方式：手动 `workflow_dispatch`、推送对应 workflow 文件、每周定时跟踪上游。
+| `enigma2-debian-arm64` | openatv/enigma2 + Debian 12 / 13 原生构建矩阵 | Enigma2、libdvbsi++、libtuxtxt 三个运行时 `.deb`，以及 `sources.lock.json` |
 
 > 注意：`dvbip_1001/1002/1004/1006_defconfig` 均为 1-2 行的差异片段，不能单独使用，
 > 必须叠在 `hi3798cv200_defconfig` 基座上（`scripts/kconfig/merge_config.sh -m`）。
 
-## Debian 12 源里没有的依赖（workflow 内源码补编）
+上游参考固件（HiSilicon-Development/firmware releases）：
+- `linux-headers-6.12.112-dvbip-1002_6.12.112-1_arm64.deb`（header 包命名与版本对齐参考）
+- `update-1002.tar.gz`（刷机包）
 
-| 依赖 | 来源 | 说明 |
-|---|---|---|
-| `sigc++-3.0` | libsigcplusplus 3.2.0 | bookworm 只有 sigc++-2.0 |
-| `libdvbsi++` | OpenVisionE2/libdvbsi | autotools，随 enigma2 一并产出 .deb |
-| `tuxtxt` | oe-alliance/tuxtxt | openATV enigma2 需要 `tuxtxt_enabledebug` 符号，仅 OE-A fork 有 |
+触发方式：手动 `workflow_dispatch`、推送对应 workflow 文件、每周定时跟踪上游。
 
-## 视频管线
+## 应用依赖与源码版本
 
-`packaging/decoder_histb_impl.h` 编译进 e2 的 `decoder.cpp`（`HAVE_HISTB`），
-内嵌实现完整解码链，无独立 video service：
-
-```
-DVB 前端 → histb-dmx (DMX_OUT_TSDEMUX_TAP)
-  → 用户态 TS/PES 解包 (HistbPesDemux)
-  → avcodec 硬解（hivxe-ffmpeg v4l2request hwaccel：MPEG1/2、H.264、HEVC、AVS/+）
-      兜底: MPEG-4/VC-1 走 v4l2m2m，再兜底软解
-  → DRM PRIME NV12 → AddFB2 → drmModeSetPlane(V0) 零拷贝
-     （VDP 缩放 + Y2R 由显示硬件完成；PTS 槽位节拍呈现）
-  → 兜底: NV12 dumb 池 + presentThread flip
-```
-
-- 音频走 avcodec 软解（MP2/AC3/DTS/AAC/EAC3/LPCM/DRA）→ swresample → ALSA。
-- OSD 为 ARGB dumb surface，primary + G0 双平面，GLES（Mesa llvmpipe EGL）blit 加速。
-- 显示模式按内容分辨率/隔行由 `histbDrmApplyMode` 切换。
+- `libsigc++-3.0` 使用 Debian 的开发包 / 运行库，不重复源码安装。
+- `libdvbsi++` 来自 OpenVisionE2/libdvbsi；`libtuxtxt` 和 `libtuxtxt32bpp` 来自 oe-alliance/tuxtxt。
+  两个运行库包只收集真正的共享库，空 payload 直接中止打包。
+- Debian 12 自带私有 Python 3.13 运行时；Debian 13 复用系统 Python 3.13。
+- 共享库依赖从实际 ELF 和目标发行版的 dpkg 元数据生成，不写死 Debian 12 的 `libswscale6`。
+- `source_refs` 工作流输入接受仓库名到分支、tag 或完整 commit 的 JSON 映射。
+  每次构建记录解析后的 `sources.lock.json`；将其作为下次输入可固定源码版本。
+  它不锁定 APT 包或 Python wheels。
 
 ## 盒子端安装
 
+选择与盒子 Debian 主版本一致的三件套。在依赖已经齐全的盒子上：
+
 ```sh
-dpkg -i linux-image-*.deb            # 内核（重启进入 6.12-dvbip-1002）
-apt update
-dpkg -i libdvbsi++_*.deb libtuxtxt_*.deb
-apt install -y -f                    # 自动补 enigma2 的 Depends（含 libegl1/libgles2/libgbm1）
-dpkg -i enigma2-hi3798cv200_*.deb
+dpkg -i ./libdvbsi++_<版本>_arm64.deb ./libtuxtxt_<版本>_arm64.deb ./enigma2-hi3798cv200_<版本>_arm64.deb
+systemctl daemon-reload
+systemctl start e2.service
 ```
 
-上游参考固件（HiSilicon-Development/firmware releases）提供
-`linux-headers-*-dvbip-1002_*.deb`（header 包命名与版本对齐参考）与 `update-1002.tar.gz`（刷机包）。
+缺少运行库时，用 `apt install ./三个对应版本的deb文件` 解析并补齐缺失项；不要使用
+`--reinstall` 重装现有依赖。安装应用无需刷入本仓库的 1002 内核。
 
-## 当前状态
+配置保存在 `/etc/enigma2`；升级只补缺失的默认文件，保留已有设置、频道和皮肤目录。
+全新配置会继承系统 `/etc/localtime` 的时区，避免首次启动把 Debian 时区重置为柏林。
+服务开机启用，不再等待一个可能根本不存在的 DVB 调谐器。
 
-- [x] 内核编译并产出 .deb（6.12.y + dvbip-1002）
-- [x] enigma2 configure/build 通过并产出 .deb（同批产出 libdvbsi++ / libtuxtxt）
-- [x] 盒端运行：e2 服务化、DVB 前端换台、视频硬解零拷贝、OSD 双平面、音频输出、遥控
-- [ ] boxtype 私有化（`BOXTYPE`/`MACHINEBUILD` 目前默认 `u5`，HiSilicon 通用路径）
-- [ ] VPSS DEI 盒内去隔行 + 显示模式锁定（换台 modeset 黑屏优化）
+浏览器打开 `http://<盒子IP>/` 使用 OpenWebif 和虚拟遥控器。
+默认未启用 Web 认证，仅应在可信局域网使用；不要直接暴露到公网。
 
-## 已知限制
+## 维护中的源码补丁
 
-- AVS2：CV200 VDH 无 AVS2 引擎，硬解不可用。
-- 4K HEVC：上游 histb-vdec 存在 HEVC 循环完成判定缺陷（`<=` 写成 `==`），
-  播 4K HEVC 需在盒上以模块级补丁解决（不随本仓库内核 .deb 分发）。
-- vendor demux tap 为突发投递，TS 断流阵发无法在呈现端弥补。
+`packaging/patches/*.patch` 在工作流已有的 Debian / HiSTB 适配之后、configure 之前按序应用：
+
+- `0001-swig43-output-typemaps.patch`：使用 SWIG 支持的输出合并接口，兼容 4.3 的 Python 指针返回绑定。
+- `0002-histb-use-actual-framebuffer-geometry.patch`：使用 fbdev 实际模式、stride 和图形上下文尺寸，
+  防止被拒绝的 720p 请求把 1080p OSD 限制在左上角，或把仍在使用的 framebuffer 区域误作空闲内存。
+- `0003-persist-video-wizard-exit.patch`：确认退出视频向导后记录完成状态，避免每次启动重复进入。
+
+打包器同时修正空运行库包、私有 Python 模块的无版本 SONAME、皮肤的绝对字体路径，
+并移除冒充 OE 固件镜像的分区 / 刷机元数据。`BOXTYPE` / `MACHINEBUILD` 仍使用上游 `u5` 兼容路径，
+不代表目标机器是 u5，也不提供固件刷写能力。
+
+## 实机验证与未验证边界
+
+2026-10-31：DVBIP-1001，Debian 13.7 arm64，已有 `6.12.114-dvbip-1001` 内核及
+`n9.0.1-33-g6c2ae2fd24-hivxe`。本地交叉编译后安装实机，已观察中文 UI、1080p framebuffer、
+OpenWebif 与网页遥控，并实际检查首次时区初始化和升级保留配置。未声称本次运行过完整 GitHub CI。
+
+- 当前实机未暴露 `/dev/dvb`，因此没有验收调谐器、搜台、DVB 直播和录制。
+- 移植解码后端依赖真实 DVB demux；安装了 hivxe-ffmpeg 不等于所有文件 / IPTV 路径已接上硬解。
+  类型 4097 的播放服务仍走 GStreamer，不能据此宣称已验证 HiSTB 解码器。
+- 遥控接收器可被枚举；实体遥控器还需要匹配实际协议和 scancode 的 RC-core keymap，本次未验收实体按键。
+- OpenWebif 页面截图未通过本次验收。图像证据取自 `/dev/fb0`，不代表已实现视频层截取。
+- 现有 `/var/stb` 适配节点不是 DRM 分辨率、音量等硬件控制的完整实现。保持现有显示模式启动，
+  不应把设置菜单中出现选项当成对应硬件能力已完成。

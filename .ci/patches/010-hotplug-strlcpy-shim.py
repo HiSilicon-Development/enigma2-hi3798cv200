@@ -17,4 +17,3 @@ static inline size_t e2_strlcpy(char *dst, const char *src, size_t size) {
     print('strlcpy shim injected')
 else:
     print('shim already present')
-

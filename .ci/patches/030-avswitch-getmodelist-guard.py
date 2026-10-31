@@ -12,4 +12,3 @@ elif new in s:
     print('AVSwitch.getModeList already patched')
 else:
     raise SystemExit('AVSwitch.py anchor not found - upstream changed, review needed')
-

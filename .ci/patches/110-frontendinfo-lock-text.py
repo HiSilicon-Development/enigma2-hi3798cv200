@@ -21,4 +21,3 @@ elif 'No meaningful text form for lock/slot-number' in s:
 else:
     raise SystemExit('FrontendInfo.py anchor not found - upstream changed, review needed')
 print('FrontendInfo.py LOCK getText assert defused')
-

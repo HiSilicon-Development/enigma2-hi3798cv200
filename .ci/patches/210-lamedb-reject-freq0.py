@@ -13,6 +13,10 @@ Guard 1 (addChannelToList): drop feparm updates with frequency 0 so a
   broken frontend read cannot clobber a good record.
 Guard 2 (saveServicelist): skip persisting any channel whose frequency is 0
   so memory pollution can never reach the disk.
+
+Both lamedb v4 and v5 loaders pass transponders through addChannelToList;
+the save guard precedes output to either format. Leave the existing parsers,
+service serialization and dangling-bouquet repair unchanged.
 """
 
 p = 'lib/dvb/db.cpp'
@@ -51,10 +55,10 @@ new1 = """RESULT eDVBDB::addChannelToList(const eDVBChannelID &id, iDVBFrontendP
 \t}
 \tch.m_frontendParameters = feparm;
 """
-if old1 in s:
+if s.count(old1) == 1:
     s = s.replace(old1, new1, 1)
     print('addChannelToList freq-0 guard inserted')
-elif 'addChannelToList: reject' in s:
+elif s.count(new1) == 1:
     print('addChannelToList guard already present')
 else:
     raise SystemExit('addChannelToList anchor not found - upstream changed, review needed')
@@ -82,17 +86,17 @@ new2 = """\t\tconst eDVBChannelID &chid = i->first;
 \t\t\telse freqchk = 1;
 \t\t\tif (freqchk == 0)
 \t\t\t{
-\t\t\t\teDebug("[eDVBDB] saveServicelist: skip %08x:%04x:%04x, frequency 0 (keeping previous lamedb record)", chid.dvbnamespace.get(), chid.transport_stream_id.get(), chid.original_network_id.get());
+\t\t\teDebug("[eDVBDB] saveServicelist: skip %08x:%04x:%04x, frequency 0 (omitted from lamedb output)", chid.dvbnamespace.get(), chid.transport_stream_id.get(), chid.original_network_id.get());
 \t\t\t\tcontinue;
 \t\t\t}
 \t\t}
 
 \t\tfprintf(f, "%08x:%04x:%04x\\n", chid.dvbnamespace.get(),
 """
-if old2 in s:
+if s.count(old2) == 1:
     s = s.replace(old2, new2, 1)
     print('saveServicelist freq-0 guard inserted')
-elif 'saveServicelist: skip' in s:
+elif s.count(new2) == 1:
     print('saveServicelist guard already present')
 else:
     raise SystemExit('saveServicelist anchor not found - upstream changed, review needed')
