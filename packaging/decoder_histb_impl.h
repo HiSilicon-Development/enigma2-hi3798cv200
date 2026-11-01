@@ -6,9 +6,11 @@
  * /dev/dvb/adapterN/{video,audio}0, absent on the histb stack) with:
  *
  *   demux PES tap (DMX_OUT_TSDEMUX_TAP) -> user-space TS/PES demux
- *     video: avcodec (hivxe-ffmpeg) with the v4l2request hwaccel
- *            (AVS+/CAVS, H.264, HEVC, MPEG2, ...) -> AV_PIX_FMT_DRM_PRIME
- *            dmabufs -> histb-vdp DRM overlay plane
+ *     video: avcodec (hivxe-ffmpeg): stateless v4l2request hwaccel
+ *            (H.264, HEVC, MPEG-2, AVS/AVS+) -> AV_PIX_FMT_DRM_PRIME
+ *            dmabufs -> histb-vdp DRM overlay plane; stateful V4L2 M2M
+ *            decoders (mpeg4_v4l2m2m, vc1_v4l2m2m) and the software
+ *            fallback present NV12 through the same plane (dumb copy)
  *     audio: avcodec (MP2/AAC/AC3/DTS/EAC3) -> swresample -> ALSA
  *
  * The hivxe-ffmpeg libraries are dlopen'ed at runtime: the binary keeps
@@ -73,6 +75,7 @@
 FF_SYM(unsigned, avcodec_version, void);
 FF_SYM(void, av_log_set_level, int level);
 FF_SYM(const AVCodec *, avcodec_find_decoder, enum AVCodecID id);
+FF_SYM(const AVCodec *, avcodec_find_decoder_by_name, const char *name);
 FF_SYM(AVCodecContext *, avcodec_alloc_context3, const AVCodec *codec);
 FF_SYM(void, avcodec_free_context, AVCodecContext **avctx);
 FF_SYM(int, avcodec_open2, AVCodecContext *avctx, const AVCodec *codec, AVDictionary **options);
@@ -106,6 +109,7 @@ FF_SYM(void, sws_freeContext, struct SwsContext *ctx);
 #define avcodec_version avcodec_version_ptr
 #define av_log_set_level av_log_set_level_ptr
 #define avcodec_find_decoder avcodec_find_decoder_ptr
+#define avcodec_find_decoder_by_name avcodec_find_decoder_by_name_ptr
 #define avcodec_alloc_context3 avcodec_alloc_context3_ptr
 #define avcodec_free_context avcodec_free_context_ptr
 #define avcodec_open2 avcodec_open2_ptr
@@ -206,6 +210,7 @@ static bool histb_ff_load()
 	FF_BIND(avcodec_version);
 	FF_BIND(av_log_set_level);
 	FF_BIND(avcodec_find_decoder);
+	FF_BIND(avcodec_find_decoder_by_name);
 	FF_BIND(avcodec_alloc_context3);
 	FF_BIND(avcodec_free_context);
 	FF_BIND(avcodec_open2);
@@ -234,6 +239,13 @@ static bool histb_ff_load()
 	FF_BIND(sws_scale);
 	FF_BIND(sws_freeContext);
 #undef FF_BIND
+
+	/* hivxe-ffmpeg keeps HEVC Main10 as P010 unless this variable is
+	 * set (v4l2_request_probe.c selects P010 with require_preferred_
+	 * format when it is absent); our V0 plane only accepts NV12, so
+	 * request the VPSS 10->8-bit downconvert.  overwrite=0 keeps an
+	 * explicit user setting intact. */
+	setenv("HISTB_V4L2REQUEST_MAIN10_NV12", "1", 0);
 
 	av_log_set_level(AV_LOG_FATAL);
 	eDebug("[histb-dec] hivxe-ffmpeg loaded, avcodec %u", avcodec_version());
@@ -710,6 +722,32 @@ public:
 		return presentFb(m_dumb_fb);
 	}
 
+	/* show one software NV12/YUV420P frame: stateful V4L2 M2M decoders
+	 * output mmap'ed NV12, the v4l2request software fallback is
+	 * YUV420P.  Copy into the NV12 dumb buffer on the V0 plane, or
+	 * convert to XRGB8888 for the legacy CRTC when no overlay plane
+	 * exists. */
+	bool showFrameSw(const AVFrame *f)
+	{
+		if (m_fd < 0 || !f || f->width <= 0 || f->height <= 0)
+			return false;
+		switch (f->format)
+		{
+		case AV_PIX_FMT_NV12:
+		case AV_PIX_FMT_YUV420P:
+		case AV_PIX_FMT_YUVJ420P:
+			break;
+		default:
+			eDebug("[histb-dec] unsupported software frame format %d", f->format);
+			return false;
+		}
+		if ((m_v0_plane_id || !m_v0_inited) && showFrameSwV0(f))
+			return true;
+		if (!m_v0_plane_id)
+			return showFrameSwXrgb(f);
+		return false;
+	}
+
 	void hide()
 	{
 		if (m_v0_plane_id && m_v0_fb)
@@ -1017,6 +1055,67 @@ private:
 				width, height, m_width, m_height);
 		}
 		return true;
+	}
+
+	/* software frame -> NV12 dumb buffer -> V0 plane (plain copy for
+	 * NV12 sources, format conversion for YUV420P) */
+	bool showFrameSwV0(const AVFrame *f)
+	{
+		if (!initV0Path(f->width, f->height))
+			return false;
+		m_v0_sws = sws_getCachedContext(m_v0_sws, f->width, f->height,
+			(enum AVPixelFormat)f->format, f->width, f->height,
+			AV_PIX_FMT_NV12, SWS_BILINEAR, nullptr, nullptr, nullptr);
+		if (!m_v0_sws)
+			return false;
+		uint8_t *dst[4] = {m_v0_map, m_v0_map + m_v0_yoff, nullptr, nullptr};
+		int dststrides[4] = {(int)m_v0_pitch, (int)m_v0_pitch, 0, 0};
+		if (sws_scale(m_v0_sws, f->data, f->linesize, 0, f->height, dst, dststrides) < 0)
+		{
+			static int swwarned = 0;
+			if (!swwarned++)
+				eWarning("[histb-dec] V0 sw frame copy failed");
+			return false;
+		}
+		int ret = drmModeSetPlane(m_fd, m_v0_plane_id, m_crtc_id, m_v0_fb,
+			0, 0, 0, m_width, m_height,
+			0, 0, (uint32_t)f->width << 16, (uint32_t)f->height << 16);
+		if (ret < 0)
+		{
+			static int spwarned = 0;
+			if (!spwarned++)
+				eWarning("[histb-dec] drmModeSetPlane(V0, sw) failed: %s", strerror(errno));
+			return false;
+		}
+		if (!m_v0_presented)
+		{
+			m_v0_presented = true;
+			eDebug("[histb-dec] first sw NV12 frame on V0 %dx%d", f->width, f->height);
+		}
+		return true;
+	}
+
+	/* software frame -> XRGB8888 dumb buffer -> legacy CRTC */
+	bool showFrameSwXrgb(const AVFrame *f)
+	{
+		if (!initSwPath())
+			return false;
+		m_sws = sws_getCachedContext(m_sws, f->width, f->height,
+			(enum AVPixelFormat)f->format, m_width, m_height,
+			AV_PIX_FMT_BGR0, SWS_BILINEAR, nullptr, nullptr, nullptr);
+		if (!m_sws)
+			return false;
+		uint8_t *dst[4] = {m_dumb_map, nullptr, nullptr, nullptr};
+		int dststrides[4] = {(int)m_dumb_pitch, 0, 0, 0};
+		if (sws_scale(m_sws, f->data, f->linesize, 0, f->height, dst, dststrides) < 0)
+			return false;
+		if (!m_sw_presented)
+		{
+			m_sw_presented = true;
+			eDebug("[histb-dec] first sw frame presented (XRGB) %dx%d -> %dx%d",
+				f->width, f->height, m_width, m_height);
+		}
+		return presentFb(m_dumb_fb);
 	}
 
 	/* legacy flip: first frame binds crtc via modeset, then pageflip
@@ -1636,17 +1735,42 @@ public:
 		if (!histb_ff_load())
 			return -1;
 
+		/* Stateless v4l2request hwaccel codecs: the software decoder is
+		 * selected by id and the hwaccel attaches via hw_device_ctx.
+		 * Stateful M2M codecs (MPEG-4 Part 2, VC-1) have no v4l2request
+		 * hwaccel; the generic find_decoder would return the software
+		 * decoder, so select the histb M2M decoder by name and fall
+		 * back to software if it cannot open. */
 		const AVCodec *codec = nullptr;
+		bool use_hwaccel = false;
 		switch (type)
 		{
-		case eDVBVideo::MPEG2:      codec = avcodec_find_decoder(AV_CODEC_ID_MPEG2VIDEO); break;
-		case eDVBVideo::MPEG1:      codec = avcodec_find_decoder(AV_CODEC_ID_MPEG1VIDEO); break;
-		case eDVBVideo::MPEG4_H264: codec = avcodec_find_decoder(AV_CODEC_ID_H264);       break;
-		case eDVBVideo::MPEG4_Part2: codec = avcodec_find_decoder(AV_CODEC_ID_MPEG4);     break;
-		case eDVBVideo::H265_HEVC:  codec = avcodec_find_decoder(AV_CODEC_ID_HEVC);       break;
-		case eDVBVideo::AVS:        codec = avcodec_find_decoder(AV_CODEC_ID_CAVS);       break;
+		case eDVBVideo::MPEG2:      codec = avcodec_find_decoder(AV_CODEC_ID_MPEG2VIDEO); use_hwaccel = true; break;
+		case eDVBVideo::MPEG1:      codec = avcodec_find_decoder(AV_CODEC_ID_MPEG1VIDEO); use_hwaccel = true; break;
+		case eDVBVideo::MPEG4_H264: codec = avcodec_find_decoder(AV_CODEC_ID_H264);       use_hwaccel = true; break;
+		case eDVBVideo::H265_HEVC:  codec = avcodec_find_decoder(AV_CODEC_ID_HEVC);       use_hwaccel = true; break;
+		case eDVBVideo::AVS:        codec = avcodec_find_decoder(AV_CODEC_ID_CAVS);       use_hwaccel = true; break;
+		case eDVBVideo::MPEG4_Part2:
+			codec = avcodec_find_decoder_by_name("mpeg4_v4l2m2m");
+			if (!codec)
+				codec = avcodec_find_decoder(AV_CODEC_ID_MPEG4);
+			break;
+		case eDVBVideo::VC1:
+			codec = avcodec_find_decoder_by_name("vc1_v4l2m2m");
+			if (!codec)
+				codec = avcodec_find_decoder(AV_CODEC_ID_VC1);
+			break;
+		case eDVBVideo::VC1_SM:
+			codec = avcodec_find_decoder_by_name("wmv3_v4l2m2m");
+			if (!codec)
+				codec = avcodec_find_decoder(AV_CODEC_ID_VC1);
+			break;
+		case eDVBVideo::AVS2:
+			/* CV200 VDH has no AVS2 engine (MV310 only upstream) */
+			eWarning("[histb-dec] AVS2 hardware decoding unavailable on CV200 (type %d)", type);
+			return -1;
 		default:
-			eWarning("[histb-dec] no video decoder for type %d (VC1/AVS2 pending)", type);
+			eWarning("[histb-dec] no video decoder for type %d", type);
 			return -1;
 		}
 		if (!codec)
@@ -1659,22 +1783,46 @@ public:
 		if (!m_avctx)
 			return -1;
 
-		/* hardware decode through the v4l2request hwaccel */
-		AVBufferRef *hwdev = nullptr;
-		if (av_hwdevice_ctx_create(&hwdev, AV_HWDEVICE_TYPE_V4L2REQUEST, nullptr, nullptr, 0) < 0)
+		if (use_hwaccel)
 		{
-			eWarning("[histb-dec] v4l2request hwdevice create failed");
-			avcodec_free_context(&m_avctx);
-			return -1;
+			/* hardware decode through the v4l2request hwaccel */
+			AVBufferRef *hwdev = nullptr;
+			if (av_hwdevice_ctx_create(&hwdev, AV_HWDEVICE_TYPE_V4L2REQUEST, nullptr, nullptr, 0) < 0)
+			{
+				eWarning("[histb-dec] v4l2request hwdevice create failed");
+				avcodec_free_context(&m_avctx);
+				return -1;
+			}
+			m_avctx->hw_device_ctx = av_buffer_ref(hwdev);
+			av_buffer_unref(&hwdev);
 		}
-		m_avctx->hw_device_ctx = av_buffer_ref(hwdev);
-		av_buffer_unref(&hwdev);
 
 		if (avcodec_open2(m_avctx, codec, nullptr) < 0)
 		{
 			eWarning("[histb-dec] avcodec_open2(%s) failed", codec->name);
 			avcodec_free_context(&m_avctx);
-			return -1;
+			m_avctx = nullptr;
+			if (!use_hwaccel && strstr(codec->name, "_v4l2m2m"))
+			{
+				/* M2M node unavailable: retry with the software decoder
+				 * and present through the sw frame path */
+				codec = avcodec_find_decoder(codec->id);
+				if (!codec)
+					return -1;
+				m_avctx = avcodec_alloc_context3(codec);
+				if (!m_avctx)
+					return -1;
+				if (avcodec_open2(m_avctx, codec, nullptr) < 0)
+				{
+					eWarning("[histb-dec] avcodec_open2(%s) failed", codec->name);
+					avcodec_free_context(&m_avctx);
+					m_avctx = nullptr;
+					return -1;
+				}
+				eDebug("[histb-dec] opened software decoder %s", codec->name);
+			}
+			else
+				return -1;
 		}
 		m_pkt = av_packet_alloc();
 		m_frame = av_frame_alloc();
@@ -1851,15 +1999,22 @@ private:
 		if (f->pts != AV_NOPTS_VALUE)
 			m_last_pts = f->pts;
 
+		/* interlace flag is valid once the codec has parsed the
+		 * sequence; emit on change so consumers see 1080i correctly */
+		int progressive = (f->flags & AV_FRAME_FLAG_INTERLACED) ? 0 : 1;
 		bool size_changed = f->width != m_width || f->height != m_height;
-		if (size_changed)
+		bool prog_changed = progressive != m_progressive;
+		if (size_changed || prog_changed)
 		{
-			m_width = f->width;
-			m_height = f->height;
-			if (f->sample_aspect_ratio.num && f->sample_aspect_ratio.den)
-				m_aspect = f->sample_aspect_ratio.num > f->sample_aspect_ratio.den ? 1 : 0; /* 1 = 16:9 */
-			m_framerate = m_avctx->framerate.den ? (int)(90000LL * m_avctx->framerate.num / m_avctx->framerate.den) : 0;
-			m_progressive = 1;
+			if (size_changed)
+			{
+				m_width = f->width;
+				m_height = f->height;
+				if (f->sample_aspect_ratio.num && f->sample_aspect_ratio.den)
+					m_aspect = f->sample_aspect_ratio.num > f->sample_aspect_ratio.den ? 1 : 0; /* 1 = 16:9 */
+				m_framerate = m_avctx->framerate.den ? (int)(90000LL * m_avctx->framerate.num / m_avctx->framerate.den) : 0;
+			}
+			m_progressive = progressive;
 			struct iTSMPEGDecoder::videoEvent ev;
 			memset(&ev, 0, sizeof(ev));
 			ev.type = iTSMPEGDecoder::videoEvent::eventSizeChanged;
@@ -1875,9 +2030,15 @@ private:
 			return;
 		if (f->format != AV_PIX_FMT_DRM_PRIME)
 		{
-			static int warned = 0;
-			if (!warned++)
-				eDebug("[histb-dec] software video frame (format %d), plane output skipped", f->format);
+			/* V4L2 M2M decoders and the v4l2request software fallback
+			 * produce NV12/YUV420P frames: present them on the video
+			 * plane instead of dropping them */
+			if (!m_drm.showFrameSw(f))
+			{
+				static int warned = 0;
+				if (!warned++)
+					eDebug("[histb-dec] software frame (format %d) not presentable", f->format);
+			}
 			return;
 		}
 		AVDRMFrameDescriptor *desc = (AVDRMFrameDescriptor *)f->data[0];
