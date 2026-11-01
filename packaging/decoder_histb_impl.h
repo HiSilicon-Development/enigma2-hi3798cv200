@@ -452,7 +452,12 @@ private:
 };
 
 /* ------------------------------------------------------------------ */
-/* DRM legacy CRTC output (histb-vdp has no KMS planes)                */
+/* DRM video output.  Native KMS histb-vdp (6.12.y upstream, 5 planes  */
+/* g1/g3/v0/v1 + g0 primary): zero-copy PRIME import onto the "v0"     */
+/* NV12 overlay (hardware ZME + VDM Y2R, composed below the G0 OSD     */
+/* via zpos).  Fallbacks: dumb-buffer copy onto the same plane, then   */
+/* legacy CRTC flip for the old simple-pipe driver (RGB-only primary,  */
+/* no KMS planes).                                                     */
 /* ------------------------------------------------------------------ */
 
 class HistbDrmOutput
@@ -544,10 +549,15 @@ public:
 	}
 
 	/* show one NV12 dmabuf described by an AVDRMFrameDescriptor.
-	 * Direct path: import dmabuf -> AddFB2(NV12) -> flip (needs a driver
-	 * with an NV12 plane). Fallback: mmap dmabuf -> sws NV12->XRGB8888
-	 * into a dumb buffer -> flip (works with the simple-pipe community
-	 * histb-vdp, whose primary plane only takes RGB formats). */
+	 * Path order:
+	 *   1. zero-copy PRIME import -> SetPlane on the "v0" overlay
+	 *      (native KMS histb-vdp: hardware ZME + VDM Y2R, video below
+	 *      the G0 OSD plane, no CRTC takeover);
+	 *   2. NV12 dumb buffer -> sws pitch copy -> same plane (drivers
+	 *      with an NV12 plane but no PRIME import);
+	 *   3. PRIME import -> AddFB2(NV12) -> legacy CRTC flip (old
+	 *      simple-pipe histb-vdp with no KMS planes at all);
+	 *   4. mmap -> sws NV12->XRGB8888 dumb buffer -> legacy CRTC flip. */
 	bool showFrame(const AVDRMFrameDescriptor *desc, int width, int height)
 	{
 		if (m_fd < 0 || !desc || desc->nb_layers < 1 || desc->nb_objects < 1)
@@ -558,10 +568,12 @@ public:
 			return false;
 		}
 
-		/* preferred: hardware video plane (V0) with ZME scaling; the video
-		 * is composed below the G0 graphics layer, so the OSD stays
-		 * visible and no CRTC takeover happens */
-		if (m_v0_plane_id || !m_v0_inited)
+		/* 1. zero-copy hardware plane path */
+		if (!m_prime_failed && tryDirectV0(desc, width, height))
+			return true;
+
+		/* 2. dumb-buffer copy path on the same plane */
+		if ((m_v0_plane_id || !m_v0_inited) && !m_sw)
 		{
 			if (showFrameV0(desc, width, height))
 				return true;
@@ -572,7 +584,10 @@ public:
 			}
 		}
 
-		if (!m_sw)
+		/* 3. PRIME import onto the legacy CRTC; pointless when a real
+		 * V0 plane exists (the NV12 fb would take over the primary
+		 * and kick the OSD off the screen) */
+		if (!m_sw && !m_v0_plane_id)
 		{
 			uint32_t handles[4] = {0, 0, 0, 0};
 			int nh = mapHandles(desc, handles);
@@ -709,7 +724,10 @@ public:
 private:
 	/* ---- V0 hardware video plane path ---- */
 
-	/* find the overlay plane that takes NV12 on our CRTC */
+	/* find the overlay plane that takes NV12 on our CRTC.  Pass 0
+	 * prefers the plane exposing exactly NV12/NV21: that is "v0" with
+	 * the ZME scaler.  "v1" (HDR unity scanout, no scaling) lists four
+	 * formats including NV15/P010 and is only picked if v0 is absent. */
 	void findV0Plane()
 	{
 		drmModePlaneResPtr pr = drmModeGetPlaneResources(m_fd);
@@ -729,27 +747,116 @@ private:
 			drmModeFreePlaneResources(pr);
 			return;
 		}
-		for (unsigned int i = 0; i < pr->count_planes && !m_v0_plane_id; ++i)
+		for (int pass = 0; pass < 2 && !m_v0_plane_id; ++pass)
 		{
-			drmModePlanePtr p = drmModeGetPlane(m_fd, pr->planes[i]);
-			if (!p)
-				continue;
-			if (p->possible_crtcs & (1u << crtc_index))
+			for (unsigned int i = 0; i < pr->count_planes && !m_v0_plane_id; ++i)
 			{
-				for (unsigned int j = 0; j < p->count_formats; ++j)
-					if (p->formats[j] == DRM_FORMAT_NV12)
-					{
-						m_v0_plane_id = p->plane_id;
-						break;
-					}
+				drmModePlanePtr p = drmModeGetPlane(m_fd, pr->planes[i]);
+				if (!p)
+					continue;
+				if (p->possible_crtcs & (1u << crtc_index))
+				{
+					for (unsigned int j = 0; j < p->count_formats; ++j)
+						if (p->formats[j] == DRM_FORMAT_NV12 &&
+						    (pass == 1 || p->count_formats == 2))
+						{
+							m_v0_plane_id = p->plane_id;
+							break;
+						}
+				}
+				drmModeFreePlane(p);
 			}
-			drmModeFreePlane(p);
 		}
 		drmModeFreePlaneResources(pr);
 		if (m_v0_plane_id)
 			eDebug("[histb-dec] V0 overlay plane %u found", m_v0_plane_id);
 		else
 			eDebug("[histb-dec] no NV12 overlay plane on crtc %u", m_crtc_id);
+	}
+
+	/* Path 1: zero-copy PRIME import onto the V0 plane.  The native KMS
+	 * histb-vdp imports the decoder dmabuf (contiguous buffers scan out
+	 * directly; scattered ones are copied by the driver into a shadow),
+	 * scales through ZME and converts through VDM Y2R in hardware, and
+	 * composes the video below the G0 OSD plane. */
+	bool tryDirectV0(const AVDRMFrameDescriptor *desc, int width, int height)
+	{
+		if (!m_v0_plane_id)
+		{
+			findV0Plane();
+			if (!m_v0_plane_id)
+			{
+				m_v0_inited = true;
+				return false;
+			}
+		}
+		if (desc->layers[0].nb_planes < 2)
+			return false;
+
+		uint32_t handles[4] = {0, 0, 0, 0};
+		int nh = mapHandles(desc, handles);
+		if (nh < 0)
+		{
+			/* driver has no PRIME import: permanent, stop retrying */
+			m_prime_failed = true;
+			return false;
+		}
+		uint32_t pitches[4] = {0, 0, 0, 0}, offsets[4] = {0, 0, 0, 0};
+		pitches[0] = desc->layers[0].planes[0].pitch;
+		offsets[0] = desc->layers[0].planes[0].offset;
+		pitches[1] = desc->layers[0].planes[1].pitch;
+		offsets[1] = desc->layers[0].planes[1].offset;
+
+		uint32_t fb = 0;
+		int ret = drmModeAddFB2(m_fd, width, height, DRM_FORMAT_NV12,
+			handles, pitches, offsets, &fb, 0);
+		if (ret < 0 || !fb)
+		{
+			static int fbwarned = 0;
+			if (!fbwarned++)
+				eDebug("[histb-dec] PRIME AddFB2(NV12) rejected (%s), using dumb path",
+					strerror(errno));
+			unmapHandles(handles);
+			m_prime_failed = true;
+			return false;
+		}
+		/* V0 plane check requires even source geometry (2<<16 - 1
+		 * alignment mask); round down odd stream sizes */
+		uint32_t sw = (uint32_t)width & ~1u;
+		uint32_t sh = (uint32_t)height & ~1u;
+		ret = drmModeSetPlane(m_fd, m_v0_plane_id, m_crtc_id, fb,
+			0, 0, 0, m_width, m_height,
+			0, 0, sw << 16, sh << 16);
+		if (ret < 0)
+		{
+			static int spwarned = 0;
+			if (!spwarned++)
+				eDebug("[histb-dec] SetPlane(V0, PRIME) failed (%s), trying dumb path",
+					strerror(errno));
+			drmModeRmFB(m_fd, fb);
+			unmapHandles(handles);
+			/* transient (master race, mode re-set): retry next frame */
+			return false;
+		}
+		/* the fb from two flips ago may still be scanned out until this
+		 * flip takes effect at vblank; free it one frame later */
+		if (m_prev_fb)
+		{
+			drmModeRmFB(m_fd, m_prev_fb);
+			m_prev_fb = 0;
+		}
+		unmapHandles(m_prev_handles);
+		m_prev_fb = m_fb;
+		memcpy(m_prev_handles, m_gem_handles, sizeof(m_gem_handles));
+		m_fb = fb;
+		memcpy(m_gem_handles, handles, sizeof(handles));
+		if (!m_prime_presented)
+		{
+			m_prime_presented = true;
+			eDebug("[histb-dec] first PRIME V0 frame %dx%d -> %dx%d (zero copy)",
+				width, height, m_width, m_height);
+		}
+		return true;
 	}
 
 	/* mmap the two decoder dmabuf planes */
@@ -1028,22 +1135,51 @@ private:
 					drmModeCrtcPtr crtc = drmModeGetCrtc(fd, crtc_id);
 					if (crtc)
 					{
-						width = crtc->mode.hdisplay;
-						height = crtc->mode.vdisplay;
-						/* legacy path: drive the CRTC directly, so remember
-						 * connector + currently active mode. histb-vdp exposes
-						 * no KMS planes at all (verified on DVBIP-1002). */
-						m_conn_id = conn->connector_id;
-						m_mode = crtc->mode;
-						drmModeFreeCrtc(crtc);
-					}
+					width = crtc->mode.hdisplay;
+					height = crtc->mode.vdisplay;
+					/* remember connector + currently active mode so
+					 * the legacy CRTC paths can re-bind it */
+					m_conn_id = conn->connector_id;
+					m_mode = crtc->mode;
+					drmModeFreeCrtc(crtc);
 				}
-				else
-					eDebug("[histb-dec] encoder %u has no crtc", conn->encoder_id);
-				if (enc)
-					drmModeFreeEncoder(enc);
 			}
-			drmModeFreeConnector(conn);
+			else
+				eDebug("[histb-dec] encoder %u has no crtc", conn->encoder_id);
+			if (enc)
+				drmModeFreeEncoder(enc);
+		}
+		drmModeFreeConnector(conn);
+		}
+		if (crtc_id < 0)
+		{
+			/* atomic drivers do not always report legacy encoder
+			 * bindings; fall back to the first connected connector
+			 * and the first CRTC (single-pipe hardware) */
+			for (int i = 0; i < res->count_connectors && !m_conn_id; ++i)
+			{
+				drmModeConnectorPtr conn = drmModeGetConnector(fd, res->connectors[i]);
+				if (!conn)
+					continue;
+				if (conn->connection == DRM_MODE_CONNECTED && conn->count_modes)
+				{
+					m_conn_id = conn->connector_id;
+					for (int m = 0; m < conn->count_modes && !m_mode.clock; ++m)
+						if (conn->modes[m].type & DRM_MODE_TYPE_PREFERRED)
+							m_mode = conn->modes[m];
+					if (!m_mode.clock)
+						m_mode = conn->modes[0];
+				}
+				drmModeFreeConnector(conn);
+			}
+			if (m_conn_id && m_mode.clock && res->count_crtcs)
+			{
+				crtc_id = res->crtcs[0];
+				width = m_mode.hdisplay;
+				height = m_mode.vdisplay;
+				eDebug("[histb-dec] atomic fallback: crtc %u connector %u %dx%d",
+					crtc_id, m_conn_id, width, height);
+			}
 		}
 		if (crtc_id < 0 || !width || !height || !m_mode.clock)
 		{
@@ -1134,6 +1270,9 @@ private:
 	struct SwsContext *m_v0_sws = nullptr;
 	bool m_v0_inited = false;
 	bool m_v0_presented = false;
+	/* direct PRIME->V0 path state */
+	bool m_prime_failed = false;
+	bool m_prime_presented = false;
 };
 
 /* ------------------------------------------------------------------ */

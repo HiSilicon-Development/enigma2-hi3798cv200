@@ -1161,14 +1161,19 @@ jobs:
           SH
           chmod 755 ${PKGDIR}/DEBIAN/postinst
 
+          # Depends 兼容 Debian 12 (bookworm) 与 13 (trixie) rootfs：
+          # - trixie 的 t64 过渡改名包用 "t64 | 旧名" 双候选
+          # - libswscale6 删除：swscale 运行期 dlopen（hivxe-ffmpeg 或系统库），
+          #   二进制不硬链接（LIBS=-lasound -ldrm -ldl），trixie 无 libswscale6
           cat > ${PKGDIR}/DEBIAN/control <<EOF
           Package: enigma2-hi3798cv200
           Version: ${E2VER}
           Architecture: arm64
           Maintainer: manhere <manhere@gmail.com>
-          Depends: gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-libav, libglib2.0-0, libfreetype6, libfribidi0, libsigc++-3.0-0, libdvbsi++, libtuxtxt, libavahi-client3, libwebp7, libgif7, libswscale6, zlib1g, libbz2-1.0, liblzma5, libffi8, libreadline8, libsqlite3-0, libncursesw6, libuuid1
+          Depends: gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-libav, libglib2.0-0t64 | libglib2.0-0, libfreetype6, libfribidi0, libsigc++-3.0-0, libdvbsi++, libtuxtxt, libavahi-client3, libwebp7, libgif7, zlib1g, libbz2-1.0, liblzma5, libffi8, libreadline8t64 | libreadline8, libsqlite3-0, libncursesw6, libuuid1
           Description: enigma2 (openATV 8.0) for HiSilicon Hi3798CV200 DVBIP-1002
            Built natively on Debian 12 arm64 via GitHub Actions.
+           Compatible with Debian 12/13 rootfs (native KMS histb-vdp video plane).
           Section: video
           Priority: optional
           EOF
