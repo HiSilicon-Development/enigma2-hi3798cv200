@@ -821,10 +821,42 @@ private:
 		if (m_v0_plane_id)
 		{
 			eDebug("[histb-dec] V0 overlay plane %u found", m_v0_plane_id);
+			forceV0ZposBelowOsd();
 			makeOsdTransparent();
 		}
 		else
 			eDebug("[histb-dec] no NV12 overlay plane on crtc %u", m_crtc_id);
+	}
+
+	/* The video plane must sit below the OSD plane: gfx zpos = id+2
+	 * (G0=2), video zpos = id-3 (V0=0).  A video plane left at a
+	 * higher zpos (e.g. leftover kernel state from experiments)
+	 * covers the whole OSD and menus become invisible.  Force V0's
+	 * zpos property back to 0. */
+	void forceV0ZposBelowOsd()
+	{
+		drmModeObjectPropertiesPtr props =
+			drmModeObjectGetProperties(m_fd, m_v0_plane_id, DRM_MODE_OBJECT_PLANE);
+		if (!props)
+			return;
+		for (unsigned int i = 0; i < props->count_props; ++i)
+		{
+			drmModePropertyResPtr p = drmModeGetProperty(m_fd, props->props[i].prop_id);
+			if (!p)
+				continue;
+			bool is_zpos = strcmp(p->name, "zpos") == 0;
+			drmModeFreeProperty(p);
+			if (is_zpos)
+			{
+				if (props->props[i].value != 0 &&
+				    drmModeObjectSetProperty(m_fd, m_v0_plane_id,
+				    DRM_MODE_OBJECT_PLANE, props->props[i].prop_id, 0) == 0)
+					eDebug("[histb-dec] V0 plane zpos %llu -> 0",
+						(unsigned long long)props->props[i].value);
+				break;
+			}
+		}
+		drmModeFreeObjectProperties(props);
 	}
 
 	/* The fbdev emulation scans the G0 OSD plane out of an XRGB8888
