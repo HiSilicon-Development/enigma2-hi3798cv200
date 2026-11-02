@@ -866,9 +866,10 @@ private:
 		drmModeFreeFB(fb);
 		uint32_t handles[4] = {handle, 0, 0, 0};
 		uint32_t pitches[4] = {pitch, 0, 0, 0};
+		uint32_t offsets[4] = {0, 0, 0, 0};
 		uint32_t argb_fb = 0;
 		if (drmModeAddFB2(m_fd, w, h, DRM_FORMAT_ARGB8888,
-			handles, pitches, nullptr, &argb_fb, 0) < 0 || !argb_fb)
+			handles, pitches, offsets, &argb_fb, 0) < 0 || !argb_fb)
 		{
 			eDebug("[histb-dec] OSD AddFB2(ARGB8888) failed: %s", strerror(errno));
 			drmCloseBufferHandle(m_fd, handle);
