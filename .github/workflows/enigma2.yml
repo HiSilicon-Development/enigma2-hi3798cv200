@@ -974,6 +974,11 @@ jobs:
           #!/bin/sh
           # OE enigma2.sh equivalent: UI supervisor loop driven by
           # quitMainloop exit codes (Screens/Standby.py QUIT_*).
+          # 自带 Python 固定: enigma2 main() 里 setenv PYTHONHOME=/usr
+          # (overwrite=0, OE 生态默认前缀), 在 Debian rootfs 上会被解析到
+          # 系统 stdlib /usr/lib/python3.13 → builtin 集合不匹配缺 math。
+          # export 后 enigma2 不再覆盖, 强制使用自带 /usr/local/lib/python3.13。
+          export PYTHONHOME=/usr/local
           BIN=/usr/local/bin/enigma2.bin
           # NetworkManager 的 /var/run/netinfo 数据源（链路/网速/流量/因特网
           # 检测），E2 启动前拉起；daemon 自身绑定固定 socket，重复启动
