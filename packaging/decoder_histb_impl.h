@@ -498,6 +498,8 @@ public:
 			/* make sure we can drive the plane even when fbcon holds KMS */
 			if (drmSetMaster(m_fd) == 0)
 				m_master = true;
+			/* expose the universal planes (G0 primary/OSD included) */
+			drmSetClientCap(m_fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1);
 			eDebug("[histb-dec] DRM output on card%d crtc %u connector %u %dx%d (legacy)",
 				card, m_crtc_id, m_conn_id, m_width, m_height);
 			return true;
@@ -511,6 +513,7 @@ public:
 		if (m_fd < 0)
 			return;
 		hide();
+		restoreOsd();
 		if (m_v0_map)
 		{
 			munmap(m_v0_map, m_v0_size);
@@ -807,9 +810,140 @@ private:
 		}
 		drmModeFreePlaneResources(pr);
 		if (m_v0_plane_id)
+		{
 			eDebug("[histb-dec] V0 overlay plane %u found", m_v0_plane_id);
+			makeOsdTransparent();
+		}
 		else
 			eDebug("[histb-dec] no NV12 overlay plane on crtc %u", m_crtc_id);
+	}
+
+	/* The fbdev emulation scans the G0 OSD plane out of an XRGB8888
+	 * framebuffer while reporting a fake transparency layout to
+	 * userspace.  enigma2 paints the OSD with an alpha channel (0 =
+	 * transparent background so the video shows through), but with
+	 * has_alpha=false and blend mode NONE the hardware ignores the
+	 * alpha byte: the OSD renders as opaque black and hides the video
+	 * plane below (root cause of "black screen while playing").
+	 * Fix: rebind the same fbdev GEM buffer as an ARGB8888 fb on the
+	 * G0 plane, switch the plane to premultiplied per-pixel alpha and
+	 * wipe the stale fbcon content to transparent.  Idempotent. */
+	bool makeOsdTransparent()
+	{
+		if (m_osd_argb_fb)
+			return true;
+		uint32_t gui_plane = 0, gui_fb = 0;
+		drmModePlaneResPtr pr = drmModeGetPlaneResources(m_fd);
+		if (!pr)
+			return false;
+		for (unsigned int i = 0; i < pr->count_planes && !gui_plane; ++i)
+		{
+			drmModePlanePtr p = drmModeGetPlane(m_fd, pr->planes[i]);
+			if (!p)
+				continue;
+			if (p->crtc_id == m_crtc_id && p->fb_id)
+			{
+				gui_plane = p->plane_id;
+				gui_fb = p->fb_id;
+			}
+			drmModeFreePlane(p);
+		}
+		drmModeFreePlaneResources(pr);
+		if (!gui_plane || !gui_fb)
+		{
+			eDebug("[histb-dec] no OSD plane scanning out crtc %u", m_crtc_id);
+			return false;
+		}
+		drmModeFBPtr fb = drmModeGetFB(m_fd, gui_fb);
+		if (!fb || !fb->handle)
+		{
+			eDebug("[histb-dec] OSD fb %u has no GEM handle", gui_fb);
+			if (fb)
+				drmModeFreeFB(fb);
+			return false;
+		}
+		uint32_t w = fb->width, h = fb->height, pitch = fb->pitch, handle = fb->handle;
+		drmModeFreeFB(fb);
+		uint32_t handles[4] = {handle, 0, 0, 0};
+		uint32_t pitches[4] = {pitch, 0, 0, 0};
+		uint32_t argb_fb = 0;
+		if (drmModeAddFB2(m_fd, w, h, DRM_FORMAT_ARGB8888,
+			handles, pitches, nullptr, &argb_fb, 0) < 0 || !argb_fb)
+		{
+			eDebug("[histb-dec] OSD AddFB2(ARGB8888) failed: %s", strerror(errno));
+			drmCloseBufferHandle(m_fd, handle);
+			return false;
+		}
+		drmCloseBufferHandle(m_fd, handle);
+		if (drmModeSetPlane(m_fd, gui_plane, m_crtc_id, argb_fb,
+			0, 0, 0, w, h, 0, 0, w << 16, h << 16) < 0)
+		{
+			eDebug("[histb-dec] OSD SetPlane(ARGB) failed: %s", strerror(errno));
+			drmModeRmFB(m_fd, argb_fb);
+			return false;
+		}
+		/* per-pixel alpha: blend mode "Pre-multiplied" (enum value 1) */
+		uint32_t blend_prop = 0;
+		drmModeObjectPropertiesPtr props =
+			drmModeObjectGetProperties(m_fd, gui_plane, DRM_MODE_OBJECT_PLANE);
+		if (props)
+		{
+			for (unsigned int i = 0; i < props->count_props && !blend_prop; ++i)
+			{
+				drmModePropertyPtr prp = drmModeGetProperty(m_fd, props->props[i]);
+				if (!prp)
+					continue;
+				if (strstr(prp->name, "blend"))
+					blend_prop = prp->prop_id;
+				drmModeFreeProperty(prp);
+			}
+			drmModeFreeObjectProperties(props);
+		}
+		bool blended = false;
+		if (blend_prop)
+			blended = drmModeObjectSetProperty(m_fd, gui_plane,
+				DRM_MODE_OBJECT_PLANE, blend_prop, 1) == 0;
+		/* wipe stale fbcon content so the screen starts transparent */
+		int fbf = ::open("/dev/fb0", O_RDWR);
+		if (fbf >= 0)
+		{
+			static const char zero[4096] = {0};
+			size_t left = (size_t)pitch * h;
+			::lseek(fbf, 0, SEEK_SET);
+			while (left)
+			{
+				ssize_t n = ::write(fbf, zero, left < sizeof(zero) ? left : sizeof(zero));
+				if (n <= 0)
+					break;
+				left -= (size_t)n;
+			}
+			::close(fbf);
+		}
+		m_osd_plane_id = gui_plane;
+		m_osd_gui_fb = gui_fb;
+		m_osd_argb_fb = argb_fb;
+		m_osd_blend_prop = blend_prop;
+		m_osd_w = w;
+		m_osd_h = h;
+		eDebug("[histb-dec] OSD plane %u -> ARGB8888 fb %u, blend %s "
+			"(video below now visible)", gui_plane, argb_fb,
+			blended ? "PREMULTI" : "unchanged");
+		return true;
+	}
+
+	/* restore the fbdev-owned OSD plane before dropping DRM master */
+	void restoreOsd()
+	{
+		if (!m_osd_argb_fb)
+			return;
+		if (m_osd_blend_prop)
+			drmModeObjectSetProperty(m_fd, m_osd_plane_id,
+				DRM_MODE_OBJECT_PLANE, m_osd_blend_prop, 0);
+		drmModeSetPlane(m_fd, m_osd_plane_id, m_crtc_id, m_osd_gui_fb,
+			0, 0, 0, m_osd_w, m_osd_h, 0, 0,
+			m_osd_w << 16, m_osd_h << 16);
+		drmModeRmFB(m_fd, m_osd_argb_fb);
+		m_osd_argb_fb = 0;
 	}
 
 	/* Path 1: zero-copy PRIME import onto the V0 plane.  The native KMS
@@ -1372,6 +1506,9 @@ private:
 	/* direct PRIME->V0 path state */
 	bool m_prime_failed = false;
 	bool m_prime_presented = false;
+	/* OSD transparency state (see makeOsdTransparent) */
+	uint32_t m_osd_plane_id = 0, m_osd_gui_fb = 0, m_osd_argb_fb = 0;
+	uint32_t m_osd_blend_prop = 0, m_osd_w = 0, m_osd_h = 0;
 };
 
 /* ------------------------------------------------------------------ */
