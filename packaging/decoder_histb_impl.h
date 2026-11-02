@@ -2393,6 +2393,18 @@ RESULT eDVBVideo::connectEvent(const sigc::slot<void(struct iTSMPEGDecoder::vide
 	if (!m_histb)
 		return -1;
 	((HistbVideoPriv *)m_histb)->setEventSink([this](const struct iTSMPEGDecoder::videoEvent &ev) {
+		/* cache the decoded attributes: iServiceInformation
+		 * (sVideoWidth/sVideoHeight/...) reads the getters below,
+		 * which otherwise stay 0 until stop() and the UI cannot
+		 * show the video's original resolution */
+		if (ev.type == iTSMPEGDecoder::videoEvent::eventSizeChanged)
+		{
+			m_width = ev.width;
+			m_height = ev.height;
+			m_aspect = ev.aspect;
+			m_progressive = ev.progressive;
+			m_framerate = ev.framerate;
+		}
 		m_event(ev);
 	});
 	conn = new eConnection(this, m_event.connect(event));
