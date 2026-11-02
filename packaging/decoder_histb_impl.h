@@ -841,18 +841,22 @@ private:
 			return;
 		for (unsigned int i = 0; i < props->count_props; ++i)
 		{
-			drmModePropertyResPtr p = drmModeGetProperty(m_fd, props->props[i].prop_id);
+			/* drmModeObjectProperties: props[] is a plain array of
+			 * property IDs, the values live in the parallel
+			 * prop_values[] array (no per-element struct) */
+			drmModePropertyPtr p = drmModeGetProperty(m_fd, props->props[i]);
 			if (!p)
 				continue;
 			bool is_zpos = strcmp(p->name, "zpos") == 0;
+			uint64_t value = props->prop_values[i];
 			drmModeFreeProperty(p);
 			if (is_zpos)
 			{
-				if (props->props[i].value != 0 &&
+				if (value != 0 &&
 				    drmModeObjectSetProperty(m_fd, m_v0_plane_id,
-				    DRM_MODE_OBJECT_PLANE, props->props[i].prop_id, 0) == 0)
+				    DRM_MODE_OBJECT_PLANE, props->props[i], 0) == 0)
 					eDebug("[histb-dec] V0 plane zpos %llu -> 0",
-						(unsigned long long)props->props[i].value);
+						(unsigned long long)value);
 				break;
 			}
 		}
