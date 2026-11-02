@@ -2345,11 +2345,15 @@ eDVBVideo::eDVBVideo(eDVBDemux *demux, int dev, bool fcc_enable)
 	HistbVideoPriv *v = new HistbVideoPriv(demux, dev);
 	m_histb = v;
 	/* deliver decode-thread events from main-loop context (see
-	 * HistbVideoPriv::emitEvent) */
+	 * HistbVideoPriv::emitEvent).  The 4th argument of create() is
+	 * "startnow" - passing false leaves the notifier inactive and
+	 * nobody would ever drain the event pipe, so events (and with
+	 * them evVideoSizeChanged / the video resolution in the UI)
+	 * would never reach anything. */
 	int evfd = v->eventFd();
 	if (evfd >= 0)
 	{
-		m_sn = eSocketNotifier::create(eApp, evfd, eSocketNotifier::Read, false);
+		m_sn = eSocketNotifier::create(eApp, evfd, eSocketNotifier::Read, true);
 		CONNECT(m_sn->activated, eDVBVideo::video_event);
 	}
 }
