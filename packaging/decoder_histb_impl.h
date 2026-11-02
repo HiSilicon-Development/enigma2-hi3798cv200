@@ -945,21 +945,31 @@ private:
 		if (blend_prop)
 			blended = drmModeObjectSetProperty(m_fd, gui_plane,
 				DRM_MODE_OBJECT_PLANE, blend_prop, 1) == 0;
-		/* wipe stale fbcon content so the screen starts transparent */
-		int fbf = ::open("/dev/fb0", O_RDWR);
-		if (fbf >= 0)
+		/* wipe stale fbcon content so the screen starts transparent.
+		 * Only once per process: enigma2 repaints just the dirty
+		 * regions, so wiping fb0 again later would erase whatever is
+		 * already on screen - an open menu was seen to vanish right
+		 * after a channel change because each new decoder instance
+		 * re-ran this wipe. */
+		static bool s_fb_wiped = false;
+		if (!s_fb_wiped)
 		{
-			static const char zero[4096] = {0};
-			size_t left = (size_t)pitch * h;
-			::lseek(fbf, 0, SEEK_SET);
-			while (left)
+			s_fb_wiped = true;
+			int fbf = ::open("/dev/fb0", O_RDWR);
+			if (fbf >= 0)
 			{
-				ssize_t n = ::write(fbf, zero, left < sizeof(zero) ? left : sizeof(zero));
-				if (n <= 0)
-					break;
-				left -= (size_t)n;
+				static const char zero[4096] = {0};
+				size_t left = (size_t)pitch * h;
+				::lseek(fbf, 0, SEEK_SET);
+				while (left)
+				{
+					ssize_t n = ::write(fbf, zero, left < sizeof(zero) ? left : sizeof(zero));
+					if (n <= 0)
+						break;
+					left -= (size_t)n;
+				}
+				::close(fbf);
 			}
-			::close(fbf);
 		}
 		m_osd_plane_id = gui_plane;
 		m_osd_gui_fb = gui_fb;
