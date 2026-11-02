@@ -797,9 +797,18 @@ private:
 					continue;
 				if (p->possible_crtcs & (1u << crtc_index))
 				{
+					/* histb-vdp driver source (6.12.y):
+					 * internal id3 "v0" advertises 4 formats
+					 * (NV12/NV21/NV15/P010) and is the only
+					 * video plane with ZME scaling (up to 8x);
+					 * id4 "v1" has 2 formats and enforces an
+					 * exact 1:1 src/dst rect (DRM_PLANE_NO_
+					 * SCALING -> -ERANGE when stretched).
+					 * Prefer v0 so 720x576 can be scaled to
+					 * the full display. */
 					for (unsigned int j = 0; j < p->count_formats; ++j)
 						if (p->formats[j] == DRM_FORMAT_NV12 &&
-						    (pass == 1 || p->count_formats == 2))
+						    (pass == 1 || p->count_formats == 4))
 						{
 							m_v0_plane_id = p->plane_id;
 							break;
