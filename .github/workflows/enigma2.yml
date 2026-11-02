@@ -1178,7 +1178,10 @@ jobs:
           # Depends 依据 2026-11-02 盒子 trixie 上 objdump -p enigma2.bin 的
           # NEEDED 实测重写（宽依赖 667MB 教训）：
           # - gstreamer 四个插件包只服务媒体播放器路径（运行期 dlopen），
-          #   挪到 Recommends；二进制硬链接的 gstreamer 核心两库进 Depends
+          #   与 DVB 收看链路（avcodec->ALSA / histb 硬解）无关，2026-11-02
+          #   按最小依赖原则整体移除；需要媒体播放器时手动
+          #   apt install gstreamer1.0-plugins-{base,good,bad} gstreamer1.0-libav。
+          #   二进制硬链接的 gstreamer 核心两库仍进 Depends
           # - 补齐 NEEDED 中此前缺失的：libasound2/libpython3.13/libjpeg62/
           #   libpng16/libxml2/libssl3/libcurl4/libgomp1/libdrm2
           # - libswscale.so.6 为硬 NEEDED，trixie 无此包，盒子侧用
@@ -1190,7 +1193,6 @@ jobs:
           Architecture: arm64
           Maintainer: manhere <manhere@gmail.com>
           Depends: libglib2.0-0t64 | libglib2.0-0, libfreetype6, libfribidi0, libsigc++-3.0-0, libdvbsi++, libtuxtxt, libavahi-client3, libavahi-common3, libwebp7, libsharpyuv0, libgif7, libpng16-16t64 | libpng16-16, libxml2, libssl3t64 | libssl3, libcurl4t64 | libcurl4, libjpeg62-turbo, libasound2t64 | libasound2, libdrm2, libgomp1, libgstreamer1.0-0, libgstreamer-plugins-base1.0-0, zlib1g, libbz2-1.0, liblzma5, libffi8, libreadline8t64 | libreadline8, libsqlite3-0, libncursesw6, libuuid1
-          Recommends: gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-libav
           Description: enigma2 (openATV 8.0) for HiSilicon Hi3798CV200 DVBIP-1002
            Built natively on Debian 12 arm64 via GitHub Actions.
            Depends tuned for Debian 13 (trixie) rootfs; bookworm needs python3.13.
