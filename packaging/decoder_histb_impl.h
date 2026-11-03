@@ -797,7 +797,10 @@ public:
 		if (curdiff < 0)
 			curdiff = -curdiff;
 		if (curdiff <= 1)
+		{
+			m_pending_framerate = 0;
 			return;
+		}
 		drmModeConnectorPtr conn = drmModeGetConnector(m_fd, m_conn_id);
 		if (!conn)
 			return;
@@ -817,8 +820,15 @@ public:
 				best = &cand;
 			}
 		}
+		if (!best)
+		{
+			/* no matching mode exists - give up for good */
+			m_pending_framerate = 0;
+			drmModeFreeConnector(conn);
+			return;
+		}
 		uint32_t fb = 0;
-		if (best && m_osd_plane_id)
+		if (m_osd_plane_id)
 		{
 			/* re-bind whatever fb the OSD/primary plane shows now */
 			drmModePlanePtr plane = drmModeGetPlane(m_fd, m_osd_plane_id);
@@ -828,7 +838,7 @@ public:
 				drmModeFreePlane(plane);
 			}
 		}
-		if (best && fb)
+		if (fb)
 		{
 			drmModeModeInfo nm = *best;
 			int ret = drmModeSetCrtc(m_fd, m_crtc_id, fb, 0, 0, &m_conn_id, 1, &nm);
@@ -838,6 +848,7 @@ public:
 					m_mode.hdisplay, m_mode.vdisplay, m_mode.vrefresh,
 					nm.vrefresh, fps);
 				m_mode = nm;
+				m_pending_framerate = 0;
 			}
 			else
 			{
@@ -845,15 +856,29 @@ public:
 				if (!mw++)
 					eWarning("[histb-dec] refresh rate switch to %u Hz failed: %s",
 						nm.vrefresh, strerror(errno));
+				m_pending_framerate = 0;
 			}
 		}
-		else if (best && !fb)
+		else
 		{
+			/* OSD fb not bound yet (adapt runs before the first frame);
+			 * retry once the first frame has been presented */
+			m_pending_framerate = ticks;
 			static int nw = 0;
 			if (!nw++)
-				eDebug("[histb-dec] refresh rate switch skipped: primary fb unknown");
+				eDebug("[histb-dec] refresh rate switch deferred: primary fb unknown");
 		}
 		drmModeFreeConnector(conn);
+	}
+
+	void retryPendingAdapt()
+	{
+		if (m_pending_framerate)
+		{
+			int t = m_pending_framerate;
+			m_pending_framerate = 0;
+			adaptToFrameRate(t);
+		}
 	}
 
 private:
@@ -1343,6 +1368,7 @@ private:
 			eDebug("[histb-dec] first V0 frame presented %dx%d -> %dx%d",
 				width, height, m_width, m_height);
 		}
+		retryPendingAdapt();
 		return true;
 	}
 
@@ -1417,7 +1443,10 @@ private:
 			eDebug("[histb-dec] first sw frame presented (XRGB) %dx%d -> %dx%d",
 				f->width, f->height, m_width, m_height);
 		}
-		return presentFb(m_dumb_fb);
+		if (!presentFb(m_dumb_fb))
+			return false;
+		retryPendingAdapt();
+		return true;
 	}
 
 	/* legacy flip: first frame binds crtc via modeset, then pageflip
@@ -1682,6 +1711,8 @@ private:
 	struct SwsContext *m_v0_sws = nullptr;
 	bool m_v0_inited = false;
 	bool m_v0_presented = false;
+	/* refresh-rate adaptation deferred until the OSD fb is bound */
+	int m_pending_framerate = 0;
 	/* direct PRIME->V0 path state */
 	bool m_prime_failed = false;
 	bool m_prime_presented = false;
