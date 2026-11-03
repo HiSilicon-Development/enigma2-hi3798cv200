@@ -516,6 +516,12 @@ public:
 				m_master = true;
 			/* expose the universal planes (G0 primary/OSD included) */
 			drmSetClientCap(m_fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1);
+			/* expose atomic plane properties (FB_ID, SRC_*, CRTC_*)
+			 * for nonblock commits; legacy ioctls keep working on
+			 * top of the atomic backend.  Ignored if the driver
+			 * lacks DRIVER_ATOMIC. */
+			if (drmSetClientCap(m_fd, DRM_CLIENT_CAP_ATOMIC, 1) == 0)
+				eDebug("[histb-dec] DRM_CLIENT_CAP_ATOMIC enabled");
 			eDebug("[histb-dec] DRM output on card%d crtc %u connector %u %dx%d (legacy)",
 				card, m_crtc_id, m_conn_id, m_width, m_height);
 			return true;
