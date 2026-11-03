@@ -600,7 +600,7 @@ public:
 	 *   3. PRIME import -> AddFB2(NV12) -> legacy CRTC flip (old
 	 *      simple-pipe histb-vdp with no KMS planes at all);
 	 *   4. mmap -> sws NV12->XRGB8888 dumb buffer -> legacy CRTC flip. */
-	bool showFrame(const AVDRMFrameDescriptor *desc, int width, int height)
+	bool showFrame(const AVDRMFrameDescriptor *desc, int width, int height, int64_t pts)
 	{
 		if (m_fd < 0 || !desc || desc->nb_layers < 1 || desc->nb_objects < 1)
 			return false;
@@ -617,7 +617,7 @@ public:
 		/* 2. dumb-buffer copy path on the same plane */
 		if ((m_v0_plane_id || !m_v0_inited) && !m_sw)
 		{
-			if (showFrameV0(desc, width, height))
+			if (showFrameV0(desc, width, height, pts))
 				return true;
 			if (!m_v0_plane_id)
 			{
@@ -757,7 +757,7 @@ public:
 	 * YUV420P.  Copy into the NV12 dumb buffer on the V0 plane, or
 	 * convert to XRGB8888 for the legacy CRTC when no overlay plane
 	 * exists. */
-	bool showFrameSw(const AVFrame *f)
+	bool showFrameSw(const AVFrame *f, int64_t pts)
 	{
 		if (m_fd < 0 || !f || f->width <= 0 || f->height <= 0)
 			return false;
@@ -771,7 +771,7 @@ public:
 			eDebug("[histb-dec] unsupported software frame format %d", f->format);
 			return false;
 		}
-		if ((m_v0_plane_id || !m_v0_inited) && showFrameSwV0(f))
+		if ((m_v0_plane_id || !m_v0_inited) && showFrameSwV0(f, pts))
 			return true;
 		if (!m_v0_plane_id)
 			return showFrameSwXrgb(f);
@@ -1524,8 +1524,39 @@ private:
 			}
 			int idx = m_present_queue.front();
 			m_present_queue.pop_front();
+			m_present_busy = true; /* in flight: pacing counts too */
+			/* frame-paced presentation: derive the frame period from
+			 * PTS deltas (90 kHz), hold each frame until its scheduled
+			 * slot and advance the slot by one period.  Decode bursts
+			 * (e.g. after TS gaps) are smoothed out; the commit still
+			 * lands on the next vblank, so the display cadence stays
+			 * vblank-aligned (25 fps = every 2nd vblank at 50 Hz). */
+			V0Buf &b = m_v0_buf[idx];
+			if (b.pts != AV_NOPTS_VALUE && m_last_presented_pts != AV_NOPTS_VALUE)
+			{
+				int64_t d = b.pts - m_last_presented_pts;
+				if (d < 0)
+					d += (1LL << 33); /* 33-bit PTS wrap */
+				if (d > 900 && d < 90000)
+				{
+					double us = (double)d * 1000000.0 / 90000.0;
+					m_frame_period_us += 0.25 * (us - m_frame_period_us);
+				}
+			}
+			m_last_presented_pts = b.pts;
+			auto now = std::chrono::steady_clock::now();
+			if (m_pacer_slot.time_since_epoch().count() == 0)
+				m_pacer_slot = now; /* first frame after (re)start */
+			if (now < m_pacer_slot)
+			{
+				m_present_cv.wait_until(lock, m_pacer_slot,
+					[&] { return m_present_stop.load(); });
+				now = std::chrono::steady_clock::now();
+			}
+			if (now > m_pacer_slot + std::chrono::microseconds((int64_t)m_frame_period_us / 2))
+				m_pacer_slot = now; /* late (stall/gap): resync */
+			m_pacer_slot += std::chrono::microseconds((int64_t)m_frame_period_us);
 			lock.unlock();
-			m_present_busy = true;
 			bool ok = commitV0(idx);
 			m_present_busy = false;
 			lock.lock();
@@ -1555,7 +1586,7 @@ private:
 		}
 	}
 
-	bool showFrameV0(const AVDRMFrameDescriptor *desc, int width, int height)
+	bool showFrameV0(const AVDRMFrameDescriptor *desc, int width, int height, int64_t pts)
 	{
 		if (!initV0Path(width, height))
 			return false;
@@ -1581,6 +1612,7 @@ private:
 		V0Buf &b = m_v0_buf[idx];
 		b.w = width;
 		b.h = height;
+		b.pts = pts;
 		copyNV12(src, strides, b.map, b.pitch, b.yoff, width, height);
 		for (int p = 0; p < 2; ++p)
 			munmap(maps[p], mapsz[p]);
@@ -1591,7 +1623,7 @@ private:
 	/* software frame -> NV12 dumb buffer -> V0 plane (format conversion
 	 * for YUV420P and friends via sws, double-buffered like the PRIME
 	 * dumb path) */
-	bool showFrameSwV0(const AVFrame *f)
+	bool showFrameSwV0(const AVFrame *f, int64_t pts)
 	{
 		if (!initV0Path(f->width, f->height))
 			return false;
@@ -1612,6 +1644,7 @@ private:
 		V0Buf &b = m_v0_buf[idx];
 		b.w = f->width;
 		b.h = f->height;
+		b.pts = pts;
 		uint8_t *dst[4] = {b.map, b.map + b.yoff, nullptr, nullptr};
 		int dststrides[4] = {(int)b.pitch, (int)b.pitch, 0, 0};
 		if (sws_scale(m_v0_sws, f->data, f->linesize, 0, f->height, dst, dststrides) < 0)
@@ -1916,16 +1949,18 @@ private:
 	/* V0 hardware video plane state */
 	uint32_t m_v0_plane_id = 0;
 	uint32_t m_v0_w = 0, m_v0_h = 0;
-	/* flip-synchronised NV12 dumb buffers: one on screen, one queued,
-	 * one being filled, one in reserve (a buffer is only rewritten
-	 * after the flip that removed it from scanout completed) */
-	enum { V0_BUFS = 4 };
+	/* flip-synchronised NV12 dumb buffers: one on screen, a few queued
+	 * (paced), one being filled (a buffer is only rewritten after the
+	 * flip that removed it from scanout completed; the headroom absorbs
+	 * decode output bursts after TS gaps) */
+	enum { V0_BUFS = 6 };
 	struct V0Buf
 	{
 		uint32_t fb = 0, handle = 0, pitch = 0, yoff = 0;
 		size_t size = 0;
 		uint8_t *map = nullptr;
 		int w = 0, h = 0;
+		int64_t pts = AV_NOPTS_VALUE;
 	};
 	V0Buf m_v0_buf[V0_BUFS];
 	/* presentation stats (logged every N frames) */
@@ -1938,12 +1973,16 @@ private:
 	std::mutex m_present_mutex;
 	std::condition_variable m_present_cv;
 	std::deque<int> m_present_queue;
-	bool m_v0_free[V0_BUFS] = {true, true, true, true};
+	bool m_v0_free[V0_BUFS] = {true, true, true, true, true, true};
 	int m_v0_onscreen = -1;
 	std::atomic<bool> m_flip_done{false};
 	std::atomic<bool> m_present_busy{false};
 	std::atomic<bool> m_present_stop{false};
 	bool m_present_running = false;
+	/* frame-paced presentation state (see presentThread) */
+	std::chrono::steady_clock::time_point m_pacer_slot{};
+	int64_t m_last_presented_pts = AV_NOPTS_VALUE;
+	double m_frame_period_us = 40000.0;
 	struct SwsContext *m_v0_sws = nullptr;
 	bool m_v0_inited = false;
 	bool m_v0_presented = false;
@@ -2581,6 +2620,15 @@ private:
 	void outputFrame()
 	{
 		AVFrame *f = m_frame;
+		/* decode output gap detection: a wall-clock gap between
+		 * consecutive decoded frames points at TS loss recovery or
+		 * decoder stalls - the visible stutter source */
+		int64_t now_us = histb_monotonicUs();
+		if (m_last_output_us && now_us - m_last_output_us > 150000)
+			eDebug("[histb-dec] decode output gap %lld ms (pts %lld)",
+				(long long)((now_us - m_last_output_us) / 1000),
+				(long long)(f->pts == AV_NOPTS_VALUE ? -1LL : f->pts));
+		m_last_output_us = now_us;
 		if (!m_first_frame)
 		{
 			m_first_frame = true;
@@ -2625,7 +2673,7 @@ private:
 			/* V4L2 M2M decoders and the v4l2request software fallback
 			 * produce NV12/YUV420P frames: present them on the video
 			 * plane instead of dropping them */
-			if (!m_drm.showFrameSw(f))
+			if (!m_drm.showFrameSw(f, f->pts))
 			{
 				static int warned = 0;
 				if (!warned++)
@@ -2634,7 +2682,7 @@ private:
 			return;
 		}
 		AVDRMFrameDescriptor *desc = (AVDRMFrameDescriptor *)f->data[0];
-		m_drm.showFrame(desc, f->width, f->height);
+		m_drm.showFrame(desc, f->width, f->height, f->pts);
 	}
 
 	ePtr<eDVBDemux> m_demux;
@@ -2644,6 +2692,7 @@ private:
 	AVPacket *m_pkt = nullptr;
 	AVFrame *m_frame = nullptr;
 	HistbDrmOutput m_drm;
+	int64_t m_last_output_us = 0;
 	enum AVCodecID m_codec_type = AV_CODEC_ID_NONE;
 	int m_pid = -1;
 	bool m_synced = false;
