@@ -1445,10 +1445,33 @@ private:
 	/* present-thread side: commit one queued V0 buffer and wait for
 	 * the flip to take effect.  Returns true when the new frame is on
 	 * screen (then the previously displayed buffer left scanout). */
+	/* follow CRTC mode changes (eAVControl may switch the HDMI mode
+	 * at runtime via the fbdev helper); one drmModeGetCrtc per commit
+	 * is cheap and keeps the video plane stretched over the new mode */
+	void syncOutputMode()
+	{
+		drmModeCrtcPtr crtc = drmModeGetCrtc(m_fd, m_crtc_id);
+		if (!crtc || !crtc->mode_valid)
+		{
+			if (crtc)
+				drmModeFreeCrtc(crtc);
+			return;
+		}
+		uint32_t w = crtc->width, h = crtc->height;
+		drmModeFreeCrtc(crtc);
+		if (w && h && (w != (uint32_t)m_width || h != (uint32_t)m_height))
+		{
+			eDebug("[histb-dec] output mode changed %dx%d -> %ux%u", m_width, m_height, w, h);
+			m_width = (int)w;
+			m_height = (int)h;
+		}
+	}
+
 	bool commitV0(int idx)
 	{
 		V0Buf &b = m_v0_buf[idx];
 		bool ok = false;
+		syncOutputMode();
 		if (m_v0_props.valid && !m_v0_atomic_failed)
 		{
 			drmModeAtomicReqPtr req = drmModeAtomicAlloc();
