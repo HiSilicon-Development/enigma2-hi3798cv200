@@ -1144,6 +1144,7 @@ private:
 	/* property ids of the V0 plane, needed for atomic commits */
 	bool initV0Props()
 	{
+		m_v0_props.tried = true;
 		drmModeObjectPropertiesPtr props =
 			drmModeObjectGetProperties(m_fd, m_v0_plane_id, DRM_MODE_OBJECT_PLANE);
 		if (!props)
@@ -1203,8 +1204,11 @@ private:
 			findV0Plane();
 			if (!m_v0_plane_id)
 				return false;
-			initV0Props();
 		}
+		/* findV0Plane may already have run in the PRIME path, so the
+		 * property enumeration must not be tied to the plane lookup */
+		if (!m_v0_props.tried)
+			initV0Props();
 		/* re-create on video size change */
 		if (m_v0_buf[0].fb)
 		{
@@ -1740,6 +1744,7 @@ private:
 		uint32_t src_x = 0, src_y = 0, src_w = 0, src_h = 0;
 		uint32_t crtc_x = 0, crtc_y = 0, crtc_w = 0, crtc_h = 0;
 		bool valid = false;
+		bool tried = false;
 	};
 	V0Props m_v0_props;
 	bool m_v0_atomic_failed = false;
