@@ -1637,6 +1637,7 @@ private:
 	int mapHandles(const AVDRMFrameDescriptor *desc, uint32_t handles[4])
 	{
 		int nh = 0;
+		static bool primelogged = false;
 		for (int l = 0; l < desc->nb_layers && nh < 4; ++l)
 			for (int p = 0; p < desc->layers[l].nb_planes && nh < 4; ++p)
 			{
@@ -1644,7 +1645,21 @@ private:
 				int fd = desc->objects[object].fd;
 				if (drmPrimeFDToHandle(m_fd, fd, &handles[nh]) < 0)
 				{
-					eWarning("[histb-dec] drmPrimeFDToHandle failed: %m");
+					if (!primelogged)
+					{
+						primelogged = true;
+						char lnk[64];
+						snprintf(lnk, sizeof(lnk), "/proc/self/fd/%d", fd);
+						char tgt[128] = "?";
+						ssize_t n = readlink(lnk, tgt, sizeof(tgt) - 1);
+						if (n >= 0)
+							tgt[n] = 0;
+						/* EINVAL from dma_buf_get means the fd is
+						 * not a dma-buf at all; anything else
+						 * points into the attach/map chain */
+						eWarning("[histb-dec] drmPrimeFDToHandle failed: %m (fd %d -> %s, size %lld)",
+							fd, tgt, (long long)desc->objects[object].size);
+					}
 					unmapHandles(handles);
 					return -1;
 				}
