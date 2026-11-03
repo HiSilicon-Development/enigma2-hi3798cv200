@@ -782,6 +782,80 @@ public:
 
 	bool valid() const { return m_fd >= 0; }
 
+	/* switch the display refresh rate to an integer multiple of the
+	 * video frame rate (25fps -> 50Hz, 30fps -> 60Hz, never 25Hz):
+	 * running 25fps broadcast on a fixed 60Hz panel gives a 2:2:2:2:3
+	 * cadence with a long frame every 200ms, perceived as periodic
+	 * stutter; same geometry keeps the OSD untouched */
+	void adaptToFrameRate(int ticks)
+	{
+		if (ticks <= 0 || m_fd < 0 || !m_conn_id || !m_mode.clock)
+			return;
+		int fps = (90000 + ticks / 2) / ticks;
+		int desired = fps <= 33 ? fps * 2 : fps;
+		int curdiff = (int)m_mode.vrefresh - desired;
+		if (curdiff < 0)
+			curdiff = -curdiff;
+		if (curdiff <= 1)
+			return;
+		drmModeConnectorPtr conn = drmModeGetConnector(m_fd, m_conn_id);
+		if (!conn)
+			return;
+		const drmModeModeInfo *best = nullptr;
+		int bestdiff = curdiff;
+		for (int m = 0; m < conn->count_modes; ++m)
+		{
+			const drmModeModeInfo &cand = conn->modes[m];
+			if (cand.hdisplay != m_mode.hdisplay || cand.vdisplay != m_mode.vdisplay)
+				continue;
+			int d = (int)cand.vrefresh - desired;
+			if (d < 0)
+				d = -d;
+			if (d < bestdiff)
+			{
+				bestdiff = d;
+				best = &cand;
+			}
+		}
+		uint32_t fb = 0;
+		if (best && m_osd_plane_id)
+		{
+			/* re-bind whatever fb the OSD/primary plane shows now */
+			drmModePlanePtr plane = drmModeGetPlane(m_fd, m_osd_plane_id);
+			if (plane)
+			{
+				fb = plane->fb_id;
+				drmModeFreePlane(plane);
+			}
+		}
+		if (best && fb)
+		{
+			drmModeModeInfo nm = *best;
+			int ret = drmModeSetCrtc(m_fd, m_crtc_id, fb, 0, 0, &m_conn_id, 1, &nm);
+			if (ret == 0)
+			{
+				eDebug("[histb-dec] display %dx%d@%u -> %u Hz (video %d fps)",
+					m_mode.hdisplay, m_mode.vdisplay, m_mode.vrefresh,
+					nm.vrefresh, fps);
+				m_mode = nm;
+			}
+			else
+			{
+				static int mw = 0;
+				if (!mw++)
+					eWarning("[histb-dec] refresh rate switch to %u Hz failed: %s",
+						nm.vrefresh, strerror(errno));
+			}
+		}
+		else if (best && !fb)
+		{
+			static int nw = 0;
+			if (!nw++)
+				eDebug("[histb-dec] refresh rate switch skipped: primary fb unknown");
+		}
+		drmModeFreeConnector(conn);
+	}
+
 private:
 	/* ---- V0 hardware video plane path ---- */
 
@@ -1321,80 +1395,6 @@ private:
 			eDebug("[histb-dec] first sw NV12 frame on V0 %dx%d", f->width, f->height);
 		}
 		return presentV0(f->width, f->height);
-	}
-
-	/* switch the display refresh rate to an integer multiple of the
-	 * video frame rate (25fps -> 50Hz, 30fps -> 60Hz, never 25Hz):
-	 * running 25fps broadcast on a fixed 60Hz panel gives a 2:2:2:2:3
-	 * cadence with a long frame every 200ms, perceived as periodic
-	 * stutter; same geometry keeps the OSD untouched */
-	void adaptToFrameRate(int ticks)
-	{
-		if (ticks <= 0 || m_fd < 0 || !m_conn_id || !m_mode.clock)
-			return;
-		int fps = (90000 + ticks / 2) / ticks;
-		int desired = fps <= 33 ? fps * 2 : fps;
-		int curdiff = (int)m_mode.vrefresh - desired;
-		if (curdiff < 0)
-			curdiff = -curdiff;
-		if (curdiff <= 1)
-			return;
-		drmModeConnectorPtr conn = drmModeGetConnector(m_fd, m_conn_id);
-		if (!conn)
-			return;
-		const drmModeModeInfo *best = nullptr;
-		int bestdiff = curdiff;
-		for (int m = 0; m < conn->count_modes; ++m)
-		{
-			const drmModeModeInfo &cand = conn->modes[m];
-			if (cand.hdisplay != m_mode.hdisplay || cand.vdisplay != m_mode.vdisplay)
-				continue;
-			int d = (int)cand.vrefresh - desired;
-			if (d < 0)
-				d = -d;
-			if (d < bestdiff)
-			{
-				bestdiff = d;
-				best = &cand;
-			}
-		}
-		uint32_t fb = 0;
-		if (best && m_osd_plane_id)
-		{
-			/* re-bind whatever fb the OSD/primary plane shows now */
-			drmModePlanePtr plane = drmModeGetPlane(m_fd, m_osd_plane_id);
-			if (plane)
-			{
-				fb = plane->fb_id;
-				drmModeFreePlane(plane);
-			}
-		}
-		if (best && fb)
-		{
-			drmModeModeInfo nm = *best;
-			int ret = drmModeSetCrtc(m_fd, m_crtc_id, fb, 0, 0, &m_conn_id, 1, &nm);
-			if (ret == 0)
-			{
-				eDebug("[histb-dec] display %dx%d@%u -> %u Hz (video %d fps)",
-					m_mode.hdisplay, m_mode.vdisplay, m_mode.vrefresh,
-					nm.vrefresh, fps);
-				m_mode = nm;
-			}
-			else
-			{
-				static int mw = 0;
-				if (!mw++)
-					eWarning("[histb-dec] refresh rate switch to %u Hz failed: %s",
-						nm.vrefresh, strerror(errno));
-			}
-		}
-		else if (best && !fb)
-		{
-			static int nw = 0;
-			if (!nw++)
-				eDebug("[histb-dec] refresh rate switch skipped: primary fb unknown");
-		}
-		drmModeFreeConnector(conn);
 	}
 
 	/* software frame -> XRGB8888 dumb buffer -> legacy CRTC */
