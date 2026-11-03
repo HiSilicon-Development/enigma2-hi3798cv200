@@ -2082,20 +2082,29 @@ public:
 			{eDVBAudio::aLPCM,  AV_CODEC_ID_PCM_S16BE, "lpcm"},
 			{eDVBAudio::aDTSHD, AV_CODEC_ID_DTS,       "dtshd"},
 			{eDVBAudio::aDDP,   AV_CODEC_ID_EAC3,      "eac3"},
+			/* hivxe-ffmpeg codec_id.h has no AV_CODEC_ID_DRA enum yet;
+			 * resolve by decoder name so an upgraded extra package with a
+			 * dra decoder becomes usable without touching enigma2 */
+			{eDVBAudio::aDRA,   AV_CODEC_ID_NONE,      "dra"},
+			{eDVBAudio::aAC4,   AV_CODEC_ID_AC4,       "ac4"},
 		};
 		const AVCodec *codec = nullptr;
+		const char *codecName = nullptr;
 		for (auto &m : map)
 			if (m.e2 == type)
 			{
 				codec = avcodec_find_decoder(m.ff);
-				if (!codec)
-					eWarning("[histb-dec] audio codec %s missing in hivxe-ffmpeg", m.name);
+				codecName = m.name;
 				break;
 			}
-		/* aDRA / aAC4 unsupported by hivxe-ffmpeg for now */
+		if (!codec && codecName)
+			codec = avcodec_find_decoder_by_name(codecName);
 		if (!codec)
 		{
-			eWarning("[histb-dec] no audio decoder for type %d (DRA/AC4 pending)", type);
+			if (codecName)
+				eWarning("[histb-dec] audio codec %s missing in hivxe-ffmpeg", codecName);
+			else
+				eWarning("[histb-dec] no audio decoder for type %d", type);
 			return -1;
 		}
 

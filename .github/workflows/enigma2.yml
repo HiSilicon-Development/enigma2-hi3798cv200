@@ -430,26 +430,38 @@ jobs:
           	drmModeConnectorPtr conn = nullptr;
           	int fd = histbOpenHdmiCard(&res, &conn);
           	if (fd < 0)
+          	{
+          		eDebug("[eAVControl] histb: no connected DRM card found");
           		return false;
+          	}
           	drmModeModeInfo mode = {};
           	bool found = histbFindDrmMode(conn, spec, mode);
           	drmModeFreeConnector(conn);
           	drmModeFreeResources(res);
           	close(fd);
           	if (!found)
+          	{
+          		eDebug("[eAVControl] histb: %dx%d%s@%d not in EDID modes", spec.w, spec.h, spec.interlaced ? "i" : "p", spec.refresh);
           		return false;
+          	}
 
           	int fb = open("/dev/fb0", O_RDWR | O_CLOEXEC);
           	if (fb < 0)
+          	{
+          		eDebug("[eAVControl] histb: fb0 open failed: %s", strerror(errno));
           		return false;
+          	}
           	struct fb_var_screeninfo v = {};
           	if (ioctl(fb, FBIOGET_VSCREENINFO, &v) < 0)
           	{
+          		eDebug("[eAVControl] histb: FBIOGET failed: %s", strerror(errno));
           		close(fb);
           		return false;
           	}
-          	v.xres = v.xres_virtual = mode.hdisplay;
-          	v.yres = v.yres_virtual = mode.vdisplay;
+          	/* keep xres/yres_virtual from GET: the driver's fbdev helper
+          	 * owns the buffer geometry, only the scanout timing changes */
+          	v.xres = mode.hdisplay;
+          	v.yres = mode.vdisplay;
           	v.xoffset = v.yoffset = 0;
           	v.pixclock = mode.clock ? 1000000000U / (unsigned)mode.clock : 0;
           	v.left_margin = mode.htotal - mode.hsync_end;
@@ -461,7 +473,10 @@ jobs:
           	v.sync = ((mode.flags & DRM_MODE_FLAG_PHSYNC) ? FB_SYNC_HOR_HIGH_ACT : 0) | ((mode.flags & DRM_MODE_FLAG_PVSYNC) ? FB_SYNC_VERT_HIGH_ACT : 0);
           	v.vmode = (mode.flags & DRM_MODE_FLAG_INTERLACE) ? FB_VMODE_INTERLACED : FB_VMODE_NONINTERLACED;
           	v.activate = FB_ACTIVATE_FORCE;
+          	v.nonstd = 0;
           	int ret = ioctl(fb, FBIOPUT_VSCREENINFO, &v);
+          	if (ret < 0)
+          		eDebug("[eAVControl] histb: FBIOPUT %dx%d@%d failed: %s (virtual %ux%u)", mode.hdisplay, mode.vdisplay, spec.refresh, strerror(errno), v.xres_virtual, v.yres_virtual);
           	close(fb);
           	return ret == 0;
           }
