@@ -791,7 +791,11 @@ public:
 	{
 		if (ticks <= 0 || m_fd < 0 || !m_conn_id || !m_mode.clock)
 			return;
-		int fps = (90000 + ticks / 2) / ticks;
+		/* m_framerate is either ticks-per-frame (3600 for 25fps) or
+		 * 90kHz ticks-per-second (2250000 for 25fps) depending on the
+		 * producer - normalise both to fps */
+		int fps = ticks >= 90000 ? (ticks + 45000) / 90000
+					 : (90000 + ticks / 2) / ticks;
 		int desired = fps <= 33 ? fps * 2 : fps;
 		int curdiff = (int)m_mode.vrefresh - desired;
 		if (curdiff < 0)
