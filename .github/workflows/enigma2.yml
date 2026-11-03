@@ -219,7 +219,6 @@ jobs:
           # fb0 FBIOPUT_VSCREENINFO，由内核 drm fbdev helper 执行。
           # 盒子实测：helper 切 CRTC 模式时 fb0 buffer 尺寸保持不变
           # （enigma2 的 mmap 持续有效，OSD plane 被拉伸到新模式）。
-          python3 - <<'EOF'
           p = 'lib/driver/avcontrol.cpp'
           s = open(p).read()
           if 'histbReadEdidModes' in s:
@@ -594,7 +593,6 @@ jobs:
 
               open(p, 'w').write(s)
               print('avcontrol.cpp histb videomode backend patched')
-          EOF
 
           # main/enigma.cpp: 盒子 Debian 无 glibc UTF-8 locale，内嵌 Python
           # locale 回退 POSIX → open() 默认 ascii → fileReadLines 读自带
