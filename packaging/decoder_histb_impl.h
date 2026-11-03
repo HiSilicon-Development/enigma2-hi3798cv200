@@ -782,109 +782,6 @@ public:
 
 	bool valid() const { return m_fd >= 0; }
 
-	/* switch the display refresh rate to an integer multiple of the
-	 * video frame rate (25fps -> 50Hz, 30fps -> 60Hz, never 25Hz):
-	 * running 25fps broadcast on a fixed 60Hz panel gives a 2:2:2:2:3
-	 * cadence with a long frame every 200ms, perceived as periodic
-	 * stutter; same geometry keeps the OSD untouched */
-	void adaptToFrameRate(int ticks)
-	{
-		if (ticks <= 0 || m_fd < 0 || !m_conn_id || !m_mode.clock)
-			return;
-		/* m_framerate is either ticks-per-frame (3600 for 25fps) or
-		 * 90kHz ticks-per-second (2250000 for 25fps) depending on the
-		 * producer - normalise both to fps */
-		int fps = ticks >= 90000 ? (ticks + 45000) / 90000
-					 : (90000 + ticks / 2) / ticks;
-		int desired = fps <= 33 ? fps * 2 : fps;
-		int curdiff = (int)m_mode.vrefresh - desired;
-		if (curdiff < 0)
-			curdiff = -curdiff;
-		if (curdiff <= 1)
-		{
-			m_pending_framerate = 0;
-			return;
-		}
-		drmModeConnectorPtr conn = drmModeGetConnector(m_fd, m_conn_id);
-		if (!conn)
-			return;
-		const drmModeModeInfo *best = nullptr;
-		int bestdiff = curdiff;
-		for (int m = 0; m < conn->count_modes; ++m)
-		{
-			const drmModeModeInfo &cand = conn->modes[m];
-			if (cand.hdisplay != m_mode.hdisplay || cand.vdisplay != m_mode.vdisplay)
-				continue;
-			int d = (int)cand.vrefresh - desired;
-			if (d < 0)
-				d = -d;
-			if (d < bestdiff)
-			{
-				bestdiff = d;
-				best = &cand;
-			}
-		}
-		if (!best)
-		{
-			/* no matching mode exists - give up for good */
-			m_pending_framerate = 0;
-			drmModeFreeConnector(conn);
-			return;
-		}
-		uint32_t fb = 0;
-		if (m_osd_plane_id)
-		{
-			/* re-bind whatever fb the OSD/primary plane shows now */
-			drmModePlanePtr plane = drmModeGetPlane(m_fd, m_osd_plane_id);
-			if (plane)
-			{
-				fb = plane->fb_id;
-				drmModeFreePlane(plane);
-			}
-		}
-		if (fb)
-		{
-			drmModeModeInfo nm = *best;
-			int ret = drmModeSetCrtc(m_fd, m_crtc_id, fb, 0, 0, &m_conn_id, 1, &nm);
-			if (ret == 0)
-			{
-				eDebug("[histb-dec] display %dx%d@%u -> %u Hz (video %d fps)",
-					m_mode.hdisplay, m_mode.vdisplay, m_mode.vrefresh,
-					nm.vrefresh, fps);
-				m_mode = nm;
-				m_pending_framerate = 0;
-			}
-			else
-			{
-				static int mw = 0;
-				if (!mw++)
-					eWarning("[histb-dec] refresh rate switch to %u Hz failed: %s",
-						nm.vrefresh, strerror(errno));
-				m_pending_framerate = 0;
-			}
-		}
-		else
-		{
-			/* OSD fb not bound yet (adapt runs before the first frame);
-			 * retry once the first frame has been presented */
-			m_pending_framerate = ticks;
-			static int nw = 0;
-			if (!nw++)
-				eDebug("[histb-dec] refresh rate switch deferred: primary fb unknown");
-		}
-		drmModeFreeConnector(conn);
-	}
-
-	void retryPendingAdapt()
-	{
-		if (m_pending_framerate)
-		{
-			int t = m_pending_framerate;
-			m_pending_framerate = 0;
-			adaptToFrameRate(t);
-		}
-	}
-
 private:
 	/* ---- V0 hardware video plane path ---- */
 
@@ -1238,6 +1135,49 @@ private:
 		return 0;
 	}
 
+	/* property ids of the V0 plane, needed for atomic commits */
+	bool initV0Props()
+	{
+		drmModeObjectPropertiesPtr props =
+			drmModeObjectGetProperties(m_fd, m_v0_plane_id, DRM_MODE_OBJECT_PLANE);
+		if (!props)
+			return false;
+		for (unsigned int i = 0; i < props->count_props; ++i)
+		{
+			drmModePropertyPtr p = drmModeGetProperty(m_fd, props->props[i]);
+			if (!p)
+				continue;
+			const char *n = p->name;
+			uint32_t id = p->prop_id;
+			if (!strcmp(n, "FB_ID"))
+				m_v0_props.fb_id = id;
+			else if (!strcmp(n, "CRTC_ID"))
+				m_v0_props.crtc_id = id;
+			else if (!strcmp(n, "SRC_X"))
+				m_v0_props.src_x = id;
+			else if (!strcmp(n, "SRC_Y"))
+				m_v0_props.src_y = id;
+			else if (!strcmp(n, "SRC_W"))
+				m_v0_props.src_w = id;
+			else if (!strcmp(n, "SRC_H"))
+				m_v0_props.src_h = id;
+			else if (!strcmp(n, "CRTC_X"))
+				m_v0_props.crtc_x = id;
+			else if (!strcmp(n, "CRTC_Y"))
+				m_v0_props.crtc_y = id;
+			else if (!strcmp(n, "CRTC_W"))
+				m_v0_props.crtc_w = id;
+			else if (!strcmp(n, "CRTC_H"))
+				m_v0_props.crtc_h = id;
+			drmModeFreeProperty(p);
+		}
+		drmModeFreeObjectProperties(props);
+		m_v0_props.valid = m_v0_props.fb_id && m_v0_props.crtc_id &&
+			m_v0_props.src_w && m_v0_props.src_h &&
+			m_v0_props.crtc_w && m_v0_props.crtc_h;
+		return m_v0_props.valid;
+	}
+
 	/* NV12 dumb buffers sized for `width x height` (one holds Y
 	 * stride*height + UV stride*height/2: allocate bpp=8 with 1.5x
 	 * height so the size matches exactly) */
@@ -1252,6 +1192,7 @@ private:
 			findV0Plane();
 			if (!m_v0_plane_id)
 				return false;
+			initV0Props();
 		}
 		/* re-create on video size change */
 		if (m_v0_buf[0].fb)
@@ -1343,36 +1284,90 @@ private:
 	bool presentV0(int width, int height)
 	{
 		V0Buf &b = m_v0_buf[m_v0_wr];
-		auto t0 = std::chrono::steady_clock::now();
-		int ret = drmModeSetPlane(m_fd, m_v0_plane_id, m_crtc_id, b.fb,
-			0, 0, 0, m_width, m_height,
-			0, 0, (uint32_t)width << 16, (uint32_t)height << 16);
-		auto us = std::chrono::duration_cast<std::chrono::microseconds>(
-			std::chrono::steady_clock::now() - t0).count();
-		unsigned prev = m_v0_setplane_max_us.load();
-		while (us > prev && !m_v0_setplane_max_us.compare_exchange_weak(prev, (unsigned)us))
-			;
-		if (ret < 0)
+		int ret = -1;
+		bool atomic_busy = false;
+		if (m_v0_props.valid && !m_v0_atomic_failed)
 		{
-			/* not deduped: count occurrence instead, log every 30th */
-			static unsigned spfails = 0;
-			if (++spfails == 1 || spfails % 30 == 0)
-				eWarning("[histb-dec] drmModeSetPlane(V0) failed (%u total): %s",
-					spfails, strerror(errno));
-			return false;
+			/* queue the flip on the next vblank without blocking:
+			 * the legacy SetPlane sleeps up to a full refresh
+			 * period (20ms @ 50Hz) inside the decode thread, which
+			 * starves decoding and drops frames */
+			drmModeAtomicReqPtr req = drmModeAtomicAlloc();
+			if (req)
+			{
+				uint32_t pid = m_v0_plane_id;
+				drmModeAtomicAddProperty(req, pid, m_v0_props.fb_id, b.fb);
+				drmModeAtomicAddProperty(req, pid, m_v0_props.crtc_id, m_crtc_id);
+				drmModeAtomicAddProperty(req, pid, m_v0_props.src_x, 0);
+				drmModeAtomicAddProperty(req, pid, m_v0_props.src_y, 0);
+				drmModeAtomicAddProperty(req, pid, m_v0_props.src_w,
+					(uint64_t)(uint32_t)width << 16);
+				drmModeAtomicAddProperty(req, pid, m_v0_props.src_h,
+					(uint64_t)(uint32_t)height << 16);
+				drmModeAtomicAddProperty(req, pid, m_v0_props.crtc_x, 0);
+				drmModeAtomicAddProperty(req, pid, m_v0_props.crtc_y, 0);
+				drmModeAtomicAddProperty(req, pid, m_v0_props.crtc_w, m_width);
+				drmModeAtomicAddProperty(req, pid, m_v0_props.crtc_h, m_height);
+				ret = drmModeAtomicCommit(m_fd, req, DRM_MODE_ATOMIC_NONBLOCK, nullptr);
+				drmModeAtomicFree(req);
+				if (ret < 0)
+				{
+					if (errno == EBUSY)
+					{
+						/* previous flip still pending - keep the
+						 * current frame on screen, drop this one */
+						atomic_busy = true;
+						static unsigned busy = 0;
+						if (++busy == 1 || busy % 500 == 0)
+							eDebug("[histb-dec] atomic V0 commit busy (%u total)", busy);
+					}
+					else
+					{
+						static int af = 0;
+						if (!af++)
+							eDebug("[histb-dec] atomic V0 commit failed (%s), legacy SetPlane fallback",
+								strerror(errno));
+						m_v0_atomic_failed = true;
+					}
+				}
+			}
+			else
+				m_v0_atomic_failed = true;
 		}
-		m_v0_wr ^= 1;
+		if (ret < 0 && !atomic_busy)
+		{
+			auto t0 = std::chrono::steady_clock::now();
+			ret = drmModeSetPlane(m_fd, m_v0_plane_id, m_crtc_id, b.fb,
+				0, 0, 0, m_width, m_height,
+				0, 0, (uint32_t)width << 16, (uint32_t)height << 16);
+			auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+				std::chrono::steady_clock::now() - t0).count();
+			unsigned prev = m_v0_setplane_max_us.load();
+			while (us > prev && !m_v0_setplane_max_us.compare_exchange_weak(prev, (unsigned)us))
+				;
+			if (ret < 0)
+			{
+				/* not deduped: count occurrence instead, log every 30th */
+				static unsigned spfails = 0;
+				if (++spfails == 1 || spfails % 30 == 0)
+					eWarning("[histb-dec] drmModeSetPlane(V0) failed (%u total): %s",
+						spfails, strerror(errno));
+				return false;
+			}
+		}
+		if (!atomic_busy)
+			m_v0_wr ^= 1;
 		unsigned frames = ++m_v0_frames;
 		if (frames % 500 == 0)
-			eDebug("[histb-dec] v0 stats: %u frames, SetPlane max %u us (blocking waits vblank)",
-				frames, m_v0_setplane_max_us.load());
+			eDebug("[histb-dec] v0 stats: %u frames, SetPlane max %u us%s",
+				frames, m_v0_setplane_max_us.load(),
+				m_v0_atomic_failed ? " (legacy blocking)" : " (atomic nonblock)");
 		if (!m_v0_presented)
 		{
 			m_v0_presented = true;
 			eDebug("[histb-dec] first V0 frame presented %dx%d -> %dx%d",
 				width, height, m_width, m_height);
 		}
-		retryPendingAdapt();
 		return true;
 	}
 
@@ -1447,10 +1442,7 @@ private:
 			eDebug("[histb-dec] first sw frame presented (XRGB) %dx%d -> %dx%d",
 				f->width, f->height, m_width, m_height);
 		}
-		if (!presentFb(m_dumb_fb))
-			return false;
-		retryPendingAdapt();
-		return true;
+		return presentFb(m_dumb_fb);
 	}
 
 	/* legacy flip: first frame binds crtc via modeset, then pageflip
@@ -1715,8 +1707,16 @@ private:
 	struct SwsContext *m_v0_sws = nullptr;
 	bool m_v0_inited = false;
 	bool m_v0_presented = false;
-	/* refresh-rate adaptation deferred until the OSD fb is bound */
-	int m_pending_framerate = 0;
+	/* atomic nonblock commit state for the V0 plane */
+	struct V0Props
+	{
+		uint32_t fb_id = 0, crtc_id = 0;
+		uint32_t src_x = 0, src_y = 0, src_w = 0, src_h = 0;
+		uint32_t crtc_x = 0, crtc_y = 0, crtc_w = 0, crtc_h = 0;
+		bool valid = false;
+	};
+	V0Props m_v0_props;
+	bool m_v0_atomic_failed = false;
 	/* direct PRIME->V0 path state */
 	bool m_prime_failed = false;
 	bool m_prime_presented = false;
@@ -2364,14 +2364,6 @@ private:
 				if (f->sample_aspect_ratio.num && f->sample_aspect_ratio.den)
 					m_aspect = f->sample_aspect_ratio.num > f->sample_aspect_ratio.den ? 1 : 0; /* 1 = 16:9 */
 				m_framerate = m_avctx->framerate.den ? (int)(90000LL * m_avctx->framerate.num / m_avctx->framerate.den) : 0;
-				if (m_framerate && m_framerate != m_adapted_framerate)
-				{
-					/* pick a display refresh that is an integer
-					 * multiple of the video rate before the first
-					 * frame lands on the plane */
-					m_adapted_framerate = m_framerate;
-					m_drm.adaptToFrameRate(m_framerate);
-				}
 			}
 			m_progressive = progressive;
 			struct iTSMPEGDecoder::videoEvent ev;
@@ -2418,7 +2410,6 @@ private:
 	bool m_first_frame = false;
 	std::atomic<bool> m_frozen{false};
 	int64_t m_last_pts = -1;
-	int m_adapted_framerate = 0;
 	int m_width = 0, m_height = 0, m_framerate = 0, m_aspect = 0, m_progressive = 0;
 	std::function<void(const struct iTSMPEGDecoder::videoEvent &)> m_event_sink;
 	int m_evpipe[2] = {-1, -1};
