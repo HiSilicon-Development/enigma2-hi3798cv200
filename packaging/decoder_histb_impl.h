@@ -344,16 +344,12 @@ private:
 	{
 		std::vector<uint8_t> buffer(TSPacketSize * 512);
 		struct pollfd pfd = {m_fd_demux, POLLIN, 0};
+		std::chrono::steady_clock::time_point last_input{};
 		while (!m_stop)
 		{
 			if (::poll(&pfd, 1, 100) <= 0)
 				continue;
 			ssize_t length = ::read(m_fd_demux, buffer.data(), buffer.size());
-			if (length > 0 && !m_first_read_done)
-			{
-				m_first_read_done = true;
-				eDebug("[histb-dec] tap pid %04x first read: %zd bytes", m_pid, length);
-			}
 			if (length < 0)
 			{
 				if (errno == EOVERFLOW)
@@ -373,6 +369,21 @@ private:
 					break;
 				}
 				continue;
+			}
+			if (length > 0)
+			{
+				/* input cadence diagnostics: large periodic gaps
+				 * between reads mean the vendor demux delivers
+				 * this tap in bursts, which the decoder then
+				 * surfaces as periodic output gaps */
+				auto now = std::chrono::steady_clock::now();
+				if (last_input.time_since_epoch().count() &&
+					now - last_input > std::chrono::milliseconds(200))
+					eDebug("[histb-dec] tap pid %04x input gap %lld ms",
+						m_pid,
+						(long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+							now - last_input).count());
+				last_input = now;
 			}
 			feed(buffer.data(), length);
 		}
@@ -467,7 +478,6 @@ private:
 	int m_pid = -1;
 	int m_cc = -1;
 	bool m_pes_broken = true;
-	bool m_first_read_done = false;
 	bool m_first_pid_packet = false;
 	bool m_first_delivered = false;
 	bool m_random_access = false;
@@ -556,6 +566,8 @@ public:
 				b.handle = 0;
 			}
 		}
+		m_v0_buf.clear();
+		m_v0_free.clear();
 		if (m_v0_sws)
 		{
 			sws_freeContext(m_v0_sws);
@@ -781,7 +793,7 @@ public:
 	void hide()
 	{
 		presentFlush();
-		if (m_v0_plane_id && m_v0_buf[0].fb)
+		if (m_v0_plane_id && !m_v0_buf.empty() && m_v0_buf[0].fb)
 			drmModeSetPlane(m_fd, m_v0_plane_id, m_crtc_id, 0,
 				0, 0, 0, 0, 0, 0, 0, 0, 0);
 		retireFrame();
@@ -1197,9 +1209,9 @@ private:
 	 * height so the size matches exactly) */
 	bool initV0Path(int width, int height)
 	{
-		if (m_v0_buf[0].fb && m_v0_w == width && m_v0_h == height)
+		if (!m_v0_buf.empty() && m_v0_buf[0].fb && m_v0_w == width && m_v0_h == height)
 			return true;
-		if (m_v0_inited && !m_v0_buf[0].fb)
+		if (m_v0_inited && (m_v0_buf.empty() || !m_v0_buf[0].fb))
 			return false;
 		if (!m_v0_plane_id)
 		{
@@ -1213,7 +1225,7 @@ private:
 			initV0Props();
 		/* re-create on video size change; the present thread must not
 		 * touch the buffers being freed */
-		if (m_v0_buf[0].fb)
+		if (!m_v0_buf.empty() && m_v0_buf[0].fb)
 		{
 			stopPresentThread();
 			drmModeSetPlane(m_fd, m_v0_plane_id, m_crtc_id, 0,
@@ -1227,6 +1239,19 @@ private:
 				munmap(b.map, b.size);
 				b.map = nullptr;
 			}
+			m_v0_buf.clear();
+			m_v0_free.clear();
+		}
+		/* pool size: 48 MB cap, at least 6 buffers to cover the
+		 * scanout/paced/being-written pipeline, at most 32 (a ~1 s
+		 * burst at 25 fps) */
+		{
+			size_t per = (size_t)((width + 63) / 64 * 64) *
+				     (size_t)(((height + 1) / 2) * 3) + 4096;
+			int nbuf = (int)(48ULL * 1024 * 1024 / per);
+			nbuf = nbuf < 6 ? 6 : (nbuf > 32 ? 32 : nbuf);
+			m_v0_buf.assign(nbuf, V0Buf{});
+			m_v0_free.assign(nbuf, 1);
 		}
 		for (auto &b : m_v0_buf)
 		{
@@ -1277,8 +1302,8 @@ private:
 		}
 		m_v0_w = width;
 		m_v0_h = height;
-		eDebug("[histb-dec] V0 path: NV12 dumb x%d %dx%d (buf %dx%d) pitch %u on plane %u",
-			V0_BUFS, width, height, width, ((height + 1) / 2) * 3,
+		eDebug("[histb-dec] V0 path: NV12 dumb x%zu %dx%d (buf %dx%d) pitch %u on plane %u",
+			m_v0_buf.size(), width, height, width, ((height + 1) / 2) * 3,
 			m_v0_buf[0].pitch, m_v0_plane_id);
 		return true;
 	}
@@ -1319,11 +1344,11 @@ private:
 	int acquireV0Buf()
 	{
 		std::lock_guard<std::mutex> l(m_present_mutex);
-		for (int i = 0; i < V0_BUFS; ++i)
+		for (size_t i = 0; i < m_v0_free.size(); ++i)
 			if (m_v0_free[i])
 			{
-				m_v0_free[i] = false;
-				return i;
+				m_v0_free[i] = 0;
+				return (int)i;
 			}
 		return -1;
 	}
@@ -1331,7 +1356,7 @@ private:
 	void releaseV0Buf(int idx)
 	{
 		std::lock_guard<std::mutex> l(m_present_mutex);
-		m_v0_free[idx] = true;
+		m_v0_free[idx] = 1;
 		m_present_cv.notify_all();
 	}
 
@@ -1366,8 +1391,7 @@ private:
 		{
 			std::lock_guard<std::mutex> l(m_present_mutex);
 			m_present_queue.clear();
-			for (int i = 0; i < V0_BUFS; ++i)
-				m_v0_free[i] = true;
+			std::fill(m_v0_free.begin(), m_v0_free.end(), 1);
 			m_v0_onscreen = -1;
 		}
 	}
@@ -1381,7 +1405,7 @@ private:
 		{
 			std::lock_guard<std::mutex> l(m_present_mutex);
 			for (int idx : m_present_queue)
-				m_v0_free[idx] = true;
+				m_v0_free[idx] = 1;
 			m_present_queue.clear();
 		}
 		m_present_cv.notify_all();
@@ -1568,7 +1592,7 @@ private:
 				int prev = m_v0_onscreen;
 				m_v0_onscreen = idx;
 				if (prev >= 0)
-					m_v0_free[prev] = true;
+					m_v0_free[prev] = 1;
 				V0Buf &b = m_v0_buf[idx];
 				if (!m_v0_presented)
 				{
@@ -1582,7 +1606,7 @@ private:
 						frames, m_v0_dropped.load());
 			}
 			else
-				m_v0_free[idx] = true;
+				m_v0_free[idx] = 1;
 		}
 	}
 
@@ -1949,11 +1973,12 @@ private:
 	/* V0 hardware video plane state */
 	uint32_t m_v0_plane_id = 0;
 	uint32_t m_v0_w = 0, m_v0_h = 0;
-	/* flip-synchronised NV12 dumb buffers: one on screen, a few queued
-	 * (paced), one being filled (a buffer is only rewritten after the
-	 * flip that removed it from scanout completed; the headroom absorbs
-	 * decode output bursts after TS gaps) */
-	enum { V0_BUFS = 6 };
+	/* flip-synchronised NV12 dumb buffers: one on screen, several
+	 * queued (paced), one being filled (a buffer is only rewritten
+	 * after the flip that removed it from scanout completed).  The
+	 * pool size adapts to the frame size under a 48 MB cap: headroom
+	 * to absorb a ~1 s decode output burst (the vendor demux
+	 * recorder-path tap delivers data in large periodic bursts). */
 	struct V0Buf
 	{
 		uint32_t fb = 0, handle = 0, pitch = 0, yoff = 0;
@@ -1962,7 +1987,8 @@ private:
 		int w = 0, h = 0;
 		int64_t pts = AV_NOPTS_VALUE;
 	};
-	V0Buf m_v0_buf[V0_BUFS];
+	std::vector<V0Buf> m_v0_buf;
+	std::vector<uint8_t> m_v0_free;
 	/* presentation stats (logged every N frames) */
 	std::atomic<unsigned> m_v0_frames{0};
 	std::atomic<unsigned> m_v0_dropped{0};
@@ -1973,7 +1999,6 @@ private:
 	std::mutex m_present_mutex;
 	std::condition_variable m_present_cv;
 	std::deque<int> m_present_queue;
-	bool m_v0_free[V0_BUFS] = {true, true, true, true, true, true};
 	int m_v0_onscreen = -1;
 	std::atomic<bool> m_flip_done{false};
 	std::atomic<bool> m_present_busy{false};
