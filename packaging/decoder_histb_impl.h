@@ -34,6 +34,7 @@
 #include <deque>
 #include <functional>
 #include <mutex>
+#include <condition_variable>
 #include <thread>
 #include <chrono>
 #include <atomic>
@@ -535,6 +536,7 @@ public:
 		if (m_fd < 0)
 			return;
 		hide();
+		stopPresentThread();
 		restoreOsd();
 		for (auto &b : m_v0_buf)
 		{
@@ -554,7 +556,6 @@ public:
 				b.handle = 0;
 			}
 		}
-		m_v0_wr = 0;
 		if (m_v0_sws)
 		{
 			sws_freeContext(m_v0_sws);
@@ -779,6 +780,7 @@ public:
 
 	void hide()
 	{
+		presentFlush();
 		if (m_v0_plane_id && m_v0_buf[0].fb)
 			drmModeSetPlane(m_fd, m_v0_plane_id, m_crtc_id, 0,
 				0, 0, 0, 0, 0, 0, 0, 0, 0);
@@ -1209,9 +1211,11 @@ private:
 		 * property enumeration must not be tied to the plane lookup */
 		if (!m_v0_props.tried)
 			initV0Props();
-		/* re-create on video size change */
+		/* re-create on video size change; the present thread must not
+		 * touch the buffers being freed */
 		if (m_v0_buf[0].fb)
 		{
+			stopPresentThread();
 			drmModeSetPlane(m_fd, m_v0_plane_id, m_crtc_id, 0,
 				0, 0, 0, 0, 0, 0, 0, 0, 0);
 			for (auto &b : m_v0_buf)
@@ -1223,7 +1227,6 @@ private:
 				munmap(b.map, b.size);
 				b.map = nullptr;
 			}
-			m_v0_wr = 0;
 		}
 		for (auto &b : m_v0_buf)
 		{
@@ -1274,8 +1277,8 @@ private:
 		}
 		m_v0_w = width;
 		m_v0_h = height;
-		eDebug("[histb-dec] V0 path: NV12 dumb x2 %dx%d (buf %dx%d) pitch %u on plane %u",
-			width, height, width, ((height + 1) / 2) * 3,
+		eDebug("[histb-dec] V0 path: NV12 dumb x%d %dx%d (buf %dx%d) pitch %u on plane %u",
+			V0_BUFS, width, height, width, ((height + 1) / 2) * 3,
 			m_v0_buf[0].pitch, m_v0_plane_id);
 		return true;
 	}
@@ -1295,20 +1298,141 @@ private:
 			memcpy(duv + r * dpitch, src[1] + r * strides[1], w);
 	}
 
-	/* present the NV12 content of the back V0 buffer and flip */
-	bool presentV0(int width, int height)
+	/* ---- flip-synchronised presentation ----
+	 *
+	 * The decode thread only copies a frame into a free buffer and
+	 * queues it; a dedicated present thread serialises the atomic
+	 * commits and waits for each page-flip event before presenting
+	 * the next frame.  This keeps the decode thread free of any
+	 * DRM stalls and never drops frames for kernel backpressure:
+	 * the previous nonblock-only design got -EBUSY whenever the
+	 * previous commit's vblank event had not fired yet (measured
+	 * 18-30% dropped frames = visible stutter). */
+
+	static void flipHandler(int, unsigned int, unsigned int, unsigned int, void *data)
 	{
-		V0Buf &b = m_v0_buf[m_v0_wr];
-		int ret = -1;
-		bool atomic_busy = false;
+		static_cast<std::atomic<bool> *>(data)->store(true, std::memory_order_release);
+	}
+
+	/* decode-thread side: reserve a buffer for writing, -1 if all in
+	 * flight (frame is dropped, the previous one stays on screen) */
+	int acquireV0Buf()
+	{
+		std::lock_guard<std::mutex> l(m_present_mutex);
+		for (int i = 0; i < V0_BUFS; ++i)
+			if (m_v0_free[i])
+			{
+				m_v0_free[i] = false;
+				return i;
+			}
+		return -1;
+	}
+
+	void releaseV0Buf(int idx)
+	{
+		std::lock_guard<std::mutex> l(m_present_mutex);
+		m_v0_free[idx] = true;
+		m_present_cv.notify_all();
+	}
+
+	void enqueueV0(int idx)
+	{
+		std::lock_guard<std::mutex> l(m_present_mutex);
+		m_present_queue.push_back(idx);
+		m_present_cv.notify_one();
+	}
+
+	void startPresentThread()
+	{
+		if (m_present_running)
+			return;
+		m_present_stop = false;
+		m_present_running = true;
+		m_present_thread = std::thread(&HistbDrmOutput::presentThread, this);
+	}
+
+	/* stop the thread and return every buffer to the free pool;
+	 * callers must not have in-flight commits afterwards */
+	void stopPresentThread()
+	{
+		if (!m_present_running)
+			return;
+		m_present_stop = true;
+		m_present_cv.notify_all();
+		if (m_present_thread.joinable())
+			m_present_thread.join();
+		m_present_running = false;
+		m_present_stop = false;
+		{
+			std::lock_guard<std::mutex> l(m_present_mutex);
+			m_present_queue.clear();
+			for (int i = 0; i < V0_BUFS; ++i)
+				m_v0_free[i] = true;
+			m_v0_onscreen = -1;
+		}
+	}
+
+	/* drop queued (never committed) frames; the on-screen buffer stays
+	 * accounted and is released by the next successful flip */
+	void presentFlush()
+	{
+		if (!m_present_running)
+			return;
+		{
+			std::lock_guard<std::mutex> l(m_present_mutex);
+			for (int idx : m_present_queue)
+				m_v0_free[idx] = true;
+			m_present_queue.clear();
+		}
+		m_present_cv.notify_all();
+		/* wait until a commit already taken by the thread is done
+		 * touching the plane */
+		auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(400);
+		while (m_present_busy && std::chrono::steady_clock::now() < deadline)
+			std::this_thread::sleep_for(std::chrono::milliseconds(2));
+	}
+
+	/* present-thread side: wait for the page-flip event of the commit
+	 * just submitted (user_data == &m_flip_done) */
+	void waitFlipEvent()
+	{
+		auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(300);
+		while (!m_flip_done.load(std::memory_order_acquire))
+		{
+			if (m_present_stop || std::chrono::steady_clock::now() >= deadline)
+			{
+				static int tw = 0;
+				if (!tw++)
+					eWarning("[histb-dec] V0 page-flip event wait timed out");
+				break;
+			}
+			struct pollfd pfd = {m_fd, POLLIN, 0};
+			if (::poll(&pfd, 1, 50) > 0)
+			{
+				drmEventContext ctx;
+				memset(&ctx, 0, sizeof(ctx));
+				ctx.version = 2;
+				ctx.page_flip_handler = flipHandler;
+				drmHandleEvent(m_fd, &ctx);
+			}
+		}
+	}
+
+	/* present-thread side: commit one queued V0 buffer and wait for
+	 * the flip to take effect.  Returns true when the new frame is on
+	 * screen (then the previously displayed buffer left scanout). */
+	bool commitV0(int idx)
+	{
+		V0Buf &b = m_v0_buf[idx];
+		bool ok = false;
 		if (m_v0_props.valid && !m_v0_atomic_failed)
 		{
-			/* queue the flip on the next vblank without blocking:
-			 * the legacy SetPlane sleeps up to a full refresh
-			 * period (20ms @ 50Hz) inside the decode thread, which
-			 * starves decoding and drops frames */
 			drmModeAtomicReqPtr req = drmModeAtomicAlloc();
-			if (req)
+			if (!req)
+			{
+				m_v0_atomic_failed = true;
+			}
+			else
 			{
 				uint32_t pid = m_v0_plane_id;
 				drmModeAtomicAddProperty(req, pid, m_v0_props.fb_id, b.fb);
@@ -1316,74 +1440,119 @@ private:
 				drmModeAtomicAddProperty(req, pid, m_v0_props.src_x, 0);
 				drmModeAtomicAddProperty(req, pid, m_v0_props.src_y, 0);
 				drmModeAtomicAddProperty(req, pid, m_v0_props.src_w,
-					(uint64_t)(uint32_t)width << 16);
+					(uint64_t)(uint32_t)b.w << 16);
 				drmModeAtomicAddProperty(req, pid, m_v0_props.src_h,
-					(uint64_t)(uint32_t)height << 16);
+					(uint64_t)(uint32_t)b.h << 16);
 				drmModeAtomicAddProperty(req, pid, m_v0_props.crtc_x, 0);
 				drmModeAtomicAddProperty(req, pid, m_v0_props.crtc_y, 0);
 				drmModeAtomicAddProperty(req, pid, m_v0_props.crtc_w, m_width);
 				drmModeAtomicAddProperty(req, pid, m_v0_props.crtc_h, m_height);
-				ret = drmModeAtomicCommit(m_fd, req, DRM_MODE_ATOMIC_NONBLOCK, nullptr);
-				drmModeAtomicFree(req);
-				if (ret < 0)
+				uint32_t flags = DRM_MODE_ATOMIC_NONBLOCK | DRM_MODE_PAGE_FLIP_EVENT;
+				m_flip_done = false;
+				int ret = drmModeAtomicCommit(m_fd, req, flags, &m_flip_done);
+				if (ret < 0 && errno == EBUSY)
 				{
-					if (errno == EBUSY)
+					/* previous flip still pending (start-up race or
+					 * an OSD legacy commit): brief retry instead of
+					 * dropping - the decode thread is never stalled */
+					for (int r = 0; r < 40 && ret < 0 && !m_present_stop; ++r)
 					{
-						/* previous flip still pending - keep the
-						 * current frame on screen, drop this one */
-						atomic_busy = true;
-						static unsigned busy = 0;
-						if (++busy == 1 || busy % 500 == 0)
-							eDebug("[histb-dec] atomic V0 commit busy (%u total)", busy);
-					}
-					else
-					{
-						static int af = 0;
-						if (!af++)
-							eDebug("[histb-dec] atomic V0 commit failed (%s), legacy SetPlane fallback",
-								strerror(errno));
-						m_v0_atomic_failed = true;
+						std::this_thread::sleep_for(std::chrono::milliseconds(5));
+						m_flip_done = false;
+						ret = drmModeAtomicCommit(m_fd, req, flags, &m_flip_done);
 					}
 				}
+				if (ret == 0)
+				{
+					waitFlipEvent();
+					ok = m_flip_done.load();
+				}
+				else if (errno == EBUSY)
+				{
+					static unsigned busy = 0;
+					if (++busy == 1 || busy % 100 == 0)
+						eWarning("[histb-dec] V0 commit still busy after retries (%u)", busy);
+				}
+				else
+				{
+					static int af = 0;
+					if (!af++)
+						eDebug("[histb-dec] atomic V0 commit failed (%s), legacy SetPlane fallback",
+							strerror(errno));
+					m_v0_atomic_failed = true;
+				}
+				drmModeAtomicFree(req);
 			}
-			else
-				m_v0_atomic_failed = true;
 		}
-		if (ret < 0 && !atomic_busy)
+		if (!ok && m_v0_atomic_failed)
 		{
+			/* legacy path blocks up to one refresh period, but this
+			 * runs on the present thread so decoding is unaffected */
 			auto t0 = std::chrono::steady_clock::now();
-			ret = drmModeSetPlane(m_fd, m_v0_plane_id, m_crtc_id, b.fb,
+			int ret = drmModeSetPlane(m_fd, m_v0_plane_id, m_crtc_id, b.fb,
 				0, 0, 0, m_width, m_height,
-				0, 0, (uint32_t)width << 16, (uint32_t)height << 16);
+				0, 0, (uint32_t)b.w << 16, (uint32_t)b.h << 16);
 			auto us = std::chrono::duration_cast<std::chrono::microseconds>(
 				std::chrono::steady_clock::now() - t0).count();
 			unsigned prev = m_v0_setplane_max_us.load();
 			while (us > prev && !m_v0_setplane_max_us.compare_exchange_weak(prev, (unsigned)us))
 				;
-			if (ret < 0)
+			if (ret == 0)
+				ok = true;
+			else
 			{
-				/* not deduped: count occurrence instead, log every 30th */
 				static unsigned spfails = 0;
 				if (++spfails == 1 || spfails % 30 == 0)
 					eWarning("[histb-dec] drmModeSetPlane(V0) failed (%u total): %s",
 						spfails, strerror(errno));
-				return false;
 			}
 		}
-		if (!atomic_busy)
-			m_v0_wr ^= 1;
-		unsigned frames = ++m_v0_frames;
-		if (frames % 500 == 0)
-			eDebug("[histb-dec] v0 stats: %u frames, SetPlane max %u us%s",
-				frames, m_v0_setplane_max_us.load(),
-				m_v0_atomic_failed ? " (legacy blocking)" : " (atomic nonblock)");
-		if (!m_v0_presented)
+		return ok;
+	}
+
+	void presentThread()
+	{
+		std::unique_lock<std::mutex> lock(m_present_mutex);
+		for (;;)
 		{
-			m_v0_presented = true;
-			eDebug("[histb-dec] first V0 frame presented %dx%d -> %dx%d",
-				width, height, m_width, m_height);
+			m_present_cv.wait(lock, [&] { return m_present_stop || !m_present_queue.empty(); });
+			if (m_present_queue.empty())
+			{
+				if (m_present_stop)
+					break;
+				continue;
+			}
+			int idx = m_present_queue.front();
+			m_present_queue.pop_front();
+			lock.unlock();
+			m_present_busy = true;
+			bool ok = commitV0(idx);
+			m_present_busy = false;
+			lock.lock();
+			if (ok)
+			{
+				/* idx is on screen now; the previously displayed
+				 * buffer left scanout at this flip and may be
+				 * rewritten by the decoder */
+				int prev = m_v0_onscreen;
+				m_v0_onscreen = idx;
+				if (prev >= 0)
+					m_v0_free[prev] = true;
+				V0Buf &b = m_v0_buf[idx];
+				if (!m_v0_presented)
+				{
+					m_v0_presented = true;
+					eDebug("[histb-dec] first V0 frame presented %dx%d -> %dx%d",
+						b.w, b.h, m_width, m_height);
+				}
+				unsigned frames = ++m_v0_frames;
+				if (frames % 500 == 0)
+					eDebug("[histb-dec] v0 stats: %u presented, %u dropped (flip-sync)",
+						frames, m_v0_dropped.load());
+			}
+			else
+				m_v0_free[idx] = true;
 		}
-		return true;
 	}
 
 	bool showFrameV0(const AVDRMFrameDescriptor *desc, int width, int height)
@@ -1398,11 +1567,25 @@ private:
 		size_t mapsz[2] = {0, 0};
 		if (mapDecoderPlanes(desc, height, src, strides, maps, mapsz) < 0)
 			return false;
-		V0Buf &b = m_v0_buf[m_v0_wr];
+		startPresentThread();
+		int idx = acquireV0Buf();
+		if (idx < 0)
+		{
+			for (int p = 0; p < 2; ++p)
+				munmap(maps[p], mapsz[p]);
+			unsigned d = ++m_v0_dropped;
+			if (d == 1 || d % 500 == 0)
+				eDebug("[histb-dec] V0 buffers exhausted, dropped %u frames", d);
+			return true; /* previous frame stays on screen */
+		}
+		V0Buf &b = m_v0_buf[idx];
+		b.w = width;
+		b.h = height;
 		copyNV12(src, strides, b.map, b.pitch, b.yoff, width, height);
 		for (int p = 0; p < 2; ++p)
 			munmap(maps[p], mapsz[p]);
-		return presentV0(width, height);
+		enqueueV0(idx);
+		return true;
 	}
 
 	/* software frame -> NV12 dumb buffer -> V0 plane (format conversion
@@ -1417,7 +1600,18 @@ private:
 			AV_PIX_FMT_NV12, SWS_BILINEAR, nullptr, nullptr, nullptr);
 		if (!m_v0_sws)
 			return false;
-		V0Buf &b = m_v0_buf[m_v0_wr];
+		startPresentThread();
+		int idx = acquireV0Buf();
+		if (idx < 0)
+		{
+			unsigned d = ++m_v0_dropped;
+			if (d == 1 || d % 500 == 0)
+				eDebug("[histb-dec] V0 buffers exhausted, dropped %u frames", d);
+			return true; /* previous frame stays on screen */
+		}
+		V0Buf &b = m_v0_buf[idx];
+		b.w = f->width;
+		b.h = f->height;
 		uint8_t *dst[4] = {b.map, b.map + b.yoff, nullptr, nullptr};
 		int dststrides[4] = {(int)b.pitch, (int)b.pitch, 0, 0};
 		if (sws_scale(m_v0_sws, f->data, f->linesize, 0, f->height, dst, dststrides) < 0)
@@ -1425,16 +1619,18 @@ private:
 			static int swwarned = 0;
 			if (!swwarned++)
 				eWarning("[histb-dec] V0 sw frame copy failed");
+			releaseV0Buf(idx);
 			return false;
 		}
 		if (!m_v0_presented)
 		{
-			/* log before presentV0 so the first-frame line keeps its
+			/* log before enqueue so the first-frame line keeps its
 			 * position relative to the dumb-path one */
 			m_v0_presented = true;
 			eDebug("[histb-dec] first sw NV12 frame on V0 %dx%d", f->width, f->height);
 		}
-		return presentV0(f->width, f->height);
+		enqueueV0(idx);
+		return true;
 	}
 
 	/* software frame -> XRGB8888 dumb buffer -> legacy CRTC */
@@ -1720,20 +1916,34 @@ private:
 	/* V0 hardware video plane state */
 	uint32_t m_v0_plane_id = 0;
 	uint32_t m_v0_w = 0, m_v0_h = 0;
-	/* two NV12 dumb buffers double-buffered against scanout: write the
-	 * back buffer, SetPlane it, then swap; a single buffer would be
-	 * rewritten while the VDP is still scanning it out */
+	/* flip-synchronised NV12 dumb buffers: one on screen, one queued,
+	 * one being filled, one in reserve (a buffer is only rewritten
+	 * after the flip that removed it from scanout completed) */
+	enum { V0_BUFS = 4 };
 	struct V0Buf
 	{
 		uint32_t fb = 0, handle = 0, pitch = 0, yoff = 0;
 		size_t size = 0;
 		uint8_t *map = nullptr;
+		int w = 0, h = 0;
 	};
-	V0Buf m_v0_buf[2];
-	int m_v0_wr = 0;
-	/* frame presentation stats (logged every N frames) */
+	V0Buf m_v0_buf[V0_BUFS];
+	/* presentation stats (logged every N frames) */
 	std::atomic<unsigned> m_v0_frames{0};
+	std::atomic<unsigned> m_v0_dropped{0};
 	std::atomic<unsigned> m_v0_setplane_max_us{0};
+	/* present thread state (see the flip-synchronised presentation
+	 * comment above) */
+	std::thread m_present_thread;
+	std::mutex m_present_mutex;
+	std::condition_variable m_present_cv;
+	std::deque<int> m_present_queue;
+	bool m_v0_free[V0_BUFS] = {true, true, true, true};
+	int m_v0_onscreen = -1;
+	std::atomic<bool> m_flip_done{false};
+	std::atomic<bool> m_present_busy{false};
+	std::atomic<bool> m_present_stop{false};
+	bool m_present_running = false;
 	struct SwsContext *m_v0_sws = nullptr;
 	bool m_v0_inited = false;
 	bool m_v0_presented = false;
