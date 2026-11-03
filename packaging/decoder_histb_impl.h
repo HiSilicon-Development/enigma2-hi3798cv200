@@ -35,6 +35,8 @@
 #include <functional>
 #include <mutex>
 #include <thread>
+#include <chrono>
+#include <atomic>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 
@@ -309,6 +311,8 @@ public:
 		m_cc = -1;
 		m_pes_broken = true;
 		m_random_access = false;
+		m_cc_breaks = 0;
+		m_overflows = 0;
 		m_partial.clear();
 		m_pes.clear();
 		m_stop = false;
@@ -353,6 +357,11 @@ private:
 			{
 				if (errno == EOVERFLOW)
 				{
+					/* demux ring overflow: data lost, decoder misses
+					 * references until the next entry point */
+					if (++m_overflows == 1 || m_overflows % 10 == 0)
+						eWarning("[histb-dec] tap pid %04x demux overflows: %u",
+							m_pid, m_overflows);
 					m_partial.clear();
 					m_pes.clear();
 					continue;
@@ -403,6 +412,11 @@ private:
 					continue;
 				if (cc != ((m_cc + 1) & 0x0f))
 				{
+					/* continuity break: PES gap, the decoder stalls
+					 * until the next entry point (visible stutter) */
+					if (++m_cc_breaks == 1 || m_cc_breaks % 250 == 0)
+						eDebug("[histb-dec] tap pid %04x CC breaks: %u",
+							m_pid, m_cc_breaks);
 					m_pes.clear();
 					m_pes_broken = true;
 				}
@@ -456,6 +470,8 @@ private:
 	bool m_first_pid_packet = false;
 	bool m_first_delivered = false;
 	bool m_random_access = false;
+	unsigned m_cc_breaks = 0;
+	unsigned m_overflows = 0;
 	std::atomic<bool> m_stop{false};
 	std::vector<uint8_t> m_partial;
 	std::vector<uint8_t> m_pes;
@@ -514,21 +530,25 @@ public:
 			return;
 		hide();
 		restoreOsd();
-		if (m_v0_map)
+		for (auto &b : m_v0_buf)
 		{
-			munmap(m_v0_map, m_v0_size);
-			m_v0_map = nullptr;
+			if (b.map)
+			{
+				munmap(b.map, b.size);
+				b.map = nullptr;
+			}
+			if (b.fb)
+			{
+				drmModeRmFB(m_fd, b.fb);
+				b.fb = 0;
+			}
+			if (b.handle)
+			{
+				destroyDumb(b.handle);
+				b.handle = 0;
+			}
 		}
-		if (m_v0_fb)
-		{
-			drmModeRmFB(m_fd, m_v0_fb);
-			m_v0_fb = 0;
-		}
-		if (m_v0_handle)
-		{
-			destroyDumb(m_v0_handle);
-			m_v0_handle = 0;
-		}
+		m_v0_wr = 0;
 		if (m_v0_sws)
 		{
 			sws_freeContext(m_v0_sws);
@@ -753,7 +773,7 @@ public:
 
 	void hide()
 	{
-		if (m_v0_plane_id && m_v0_fb)
+		if (m_v0_plane_id && m_v0_buf[0].fb)
 			drmModeSetPlane(m_fd, m_v0_plane_id, m_crtc_id, 0,
 				0, 0, 0, 0, 0, 0, 0, 0, 0);
 		retireFrame();
@@ -1115,12 +1135,14 @@ private:
 		return 0;
 	}
 
-	/* NV12 dumb buffer sized for `width x height`, second handle for chroma */
+	/* NV12 dumb buffers sized for `width x height` (one holds Y
+	 * stride*height + UV stride*height/2: allocate bpp=8 with 1.5x
+	 * height so the size matches exactly) */
 	bool initV0Path(int width, int height)
 	{
-		if (m_v0_fb && m_v0_w == width && m_v0_h == height)
+		if (m_v0_buf[0].fb && m_v0_w == width && m_v0_h == height)
 			return true;
-		if (m_v0_inited && !m_v0_fb)
+		if (m_v0_inited && !m_v0_buf[0].fb)
 			return false;
 		if (!m_v0_plane_id)
 		{
@@ -1129,68 +1151,124 @@ private:
 				return false;
 		}
 		/* re-create on video size change */
-		if (m_v0_fb)
+		if (m_v0_buf[0].fb)
 		{
 			drmModeSetPlane(m_fd, m_v0_plane_id, m_crtc_id, 0,
 				0, 0, 0, 0, 0, 0, 0, 0, 0);
-			drmModeRmFB(m_fd, m_v0_fb);
-			m_v0_fb = 0;
-			destroyDumb(m_v0_handle);
-			m_v0_handle = 0;
-			munmap(m_v0_map, m_v0_size);
-			m_v0_map = nullptr;
+			for (auto &b : m_v0_buf)
+			{
+				drmModeRmFB(m_fd, b.fb);
+				b.fb = 0;
+				destroyDumb(b.handle);
+				b.handle = 0;
+				munmap(b.map, b.size);
+				b.map = nullptr;
+			}
+			m_v0_wr = 0;
 		}
-		/* one dumb buffer holds Y (stride*height) + UV (stride*height/2):
-		 * allocate bpp=8 with 1.5x height so the size matches exactly */
-		struct drm_mode_create_dumb creq = {};
-		creq.width = width;
-		creq.height = ((height + 1) / 2) * 3;
-		creq.bpp = 8;
-		if (::ioctl(m_fd, DRM_IOCTL_MODE_CREATE_DUMB, &creq) < 0)
+		for (auto &b : m_v0_buf)
 		{
-			eWarning("[histb-dec] create NV12 dumb buffer failed: %s", strerror(errno));
-			return false;
+			struct drm_mode_create_dumb creq = {};
+			creq.width = width;
+			creq.height = ((height + 1) / 2) * 3;
+			creq.bpp = 8;
+			if (::ioctl(m_fd, DRM_IOCTL_MODE_CREATE_DUMB, &creq) < 0)
+			{
+				eWarning("[histb-dec] create NV12 dumb buffer failed: %s", strerror(errno));
+				return false;
+			}
+			b.yoff = creq.pitch * (uint32_t)height;
+			uint32_t handles[4] = {creq.handle, creq.handle, 0, 0};
+			uint32_t pitches[4] = {creq.pitch, creq.pitch, 0, 0};
+			uint32_t offsets[4] = {0, b.yoff, 0, 0};
+			if (drmModeAddFB2(m_fd, width, height, DRM_FORMAT_NV12,
+				handles, pitches, offsets, &b.fb, 0) < 0 || !b.fb)
+			{
+				eWarning("[histb-dec] AddFB2 NV12 dumb failed: %s", strerror(errno));
+				destroyDumb(creq.handle);
+				return false;
+			}
+			struct drm_mode_map_dumb mreq = {};
+			mreq.handle = creq.handle;
+			if (::ioctl(m_fd, DRM_IOCTL_MODE_MAP_DUMB, &mreq) < 0)
+			{
+				eWarning("[histb-dec] map NV12 dumb failed: %s", strerror(errno));
+				drmModeRmFB(m_fd, b.fb);
+				b.fb = 0;
+				destroyDumb(creq.handle);
+				return false;
+			}
+			b.map = (uint8_t *)mmap(nullptr, creq.size,
+				PROT_READ | PROT_WRITE, MAP_SHARED, m_fd, mreq.offset);
+			if (b.map == MAP_FAILED)
+			{
+				b.map = nullptr;
+				drmModeRmFB(m_fd, b.fb);
+				b.fb = 0;
+				destroyDumb(creq.handle);
+				eWarning("[histb-dec] mmap NV12 dumb failed: %s", strerror(errno));
+				return false;
+			}
+			b.handle = creq.handle;
+			b.pitch = creq.pitch;
+			b.size = creq.size;
 		}
-		uint32_t yoff = creq.pitch * (uint32_t)height;
-		uint32_t handles[4] = {creq.handle, creq.handle, 0, 0};
-		uint32_t pitches[4] = {creq.pitch, creq.pitch, 0, 0};
-		uint32_t offsets[4] = {0, yoff, 0, 0};
-		if (drmModeAddFB2(m_fd, width, height, DRM_FORMAT_NV12,
-			handles, pitches, offsets, &m_v0_fb, 0) < 0 || !m_v0_fb)
-		{
-			eWarning("[histb-dec] AddFB2 NV12 dumb failed: %s", strerror(errno));
-			destroyDumb(creq.handle);
-			return false;
-		}
-		struct drm_mode_map_dumb mreq = {};
-		mreq.handle = creq.handle;
-		if (::ioctl(m_fd, DRM_IOCTL_MODE_MAP_DUMB, &mreq) < 0)
-		{
-			eWarning("[histb-dec] map NV12 dumb failed: %s", strerror(errno));
-			drmModeRmFB(m_fd, m_v0_fb);
-			m_v0_fb = 0;
-			destroyDumb(creq.handle);
-			return false;
-		}
-		m_v0_map = (uint8_t *)mmap(nullptr, creq.size,
-			PROT_READ | PROT_WRITE, MAP_SHARED, m_fd, mreq.offset);
-		if (m_v0_map == MAP_FAILED)
-		{
-			m_v0_map = nullptr;
-			drmModeRmFB(m_fd, m_v0_fb);
-			m_v0_fb = 0;
-			destroyDumb(creq.handle);
-			eWarning("[histb-dec] mmap NV12 dumb failed: %s", strerror(errno));
-			return false;
-		}
-		m_v0_handle = creq.handle;
-		m_v0_pitch = creq.pitch;
-		m_v0_size = creq.size;
-		m_v0_yoff = yoff;
 		m_v0_w = width;
 		m_v0_h = height;
-		eDebug("[histb-dec] V0 path: NV12 dumb %dx%d (buf %ux%u) pitch %u on plane %u",
-			width, height, creq.width, creq.height, m_v0_pitch, m_v0_plane_id);
+		eDebug("[histb-dec] V0 path: NV12 dumb x2 %dx%d (buf %dx%d) pitch %u on plane %u",
+			width, height, width, ((height + 1) / 2) * 3,
+			m_v0_buf[0].pitch, m_v0_plane_id);
+		return true;
+	}
+
+	/* NV12 -> NV12 row copy (handles differing pitch); far cheaper than
+	 * routing through sws_scale for a like-for-like transfer */
+	static void copyNV12(const uint8_t *src[2], const int strides[2],
+			     uint8_t *dst, uint32_t dpitch, uint32_t yoff,
+			     int width, int height)
+	{
+		uint32_t w = (uint32_t)width;
+		uint32_t h = (uint32_t)height;
+		for (uint32_t r = 0; r < h; ++r)
+			memcpy(dst + r * dpitch, src[0] + r * strides[0], w);
+		uint8_t *duv = dst + yoff;
+		for (uint32_t r = 0; r < h / 2; ++r)
+			memcpy(duv + r * dpitch, src[1] + r * strides[1], w);
+	}
+
+	/* present the NV12 content of the back V0 buffer and flip */
+	bool presentV0(int width, int height)
+	{
+		V0Buf &b = m_v0_buf[m_v0_wr];
+		auto t0 = std::chrono::steady_clock::now();
+		int ret = drmModeSetPlane(m_fd, m_v0_plane_id, m_crtc_id, b.fb,
+			0, 0, 0, m_width, m_height,
+			0, 0, (uint32_t)width << 16, (uint32_t)height << 16);
+		auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+			std::chrono::steady_clock::now() - t0).count();
+		unsigned prev = m_v0_setplane_max_us.load();
+		while (us > prev && !m_v0_setplane_max_us.compare_exchange_weak(prev, (unsigned)us))
+			;
+		if (ret < 0)
+		{
+			/* not deduped: count occurrence instead, log every 30th */
+			static unsigned spfails = 0;
+			if (++spfails == 1 || spfails % 30 == 0)
+				eWarning("[histb-dec] drmModeSetPlane(V0) failed (%u total): %s",
+					spfails, strerror(errno));
+			return false;
+		}
+		m_v0_wr ^= 1;
+		unsigned frames = ++m_v0_frames;
+		if (frames % 500 == 0)
+			eDebug("[histb-dec] v0 stats: %u frames, SetPlane max %u us (blocking waits vblank)",
+				frames, m_v0_setplane_max_us.load());
+		if (!m_v0_presented)
+		{
+			m_v0_presented = true;
+			eDebug("[histb-dec] first V0 frame presented %dx%d -> %dx%d",
+				width, height, m_width, m_height);
+		}
 		return true;
 	}
 
@@ -1206,49 +1284,16 @@ private:
 		size_t mapsz[2] = {0, 0};
 		if (mapDecoderPlanes(desc, height, src, strides, maps, mapsz) < 0)
 			return false;
-		/* NV12 -> NV12: no colour conversion, only pitch fixup */
-		m_v0_sws = sws_getCachedContext(m_v0_sws, width, height, AV_PIX_FMT_NV12,
-			width, height, AV_PIX_FMT_NV12, SWS_BILINEAR,
-			nullptr, nullptr, nullptr);
-		if (!m_v0_sws)
-		{
-			for (int p = 0; p < 2; ++p)
-				munmap(maps[p], mapsz[p]);
-			return false;
-		}
-		uint8_t *dst[4] = {m_v0_map, m_v0_map + m_v0_yoff, nullptr, nullptr};
-		int dststrides[4] = {(int)m_v0_pitch, (int)m_v0_pitch, 0, 0};
-		int rc = sws_scale(m_v0_sws, src, strides, 0, height, dst, dststrides);
+		V0Buf &b = m_v0_buf[m_v0_wr];
+		copyNV12(src, strides, b.map, b.pitch, b.yoff, width, height);
 		for (int p = 0; p < 2; ++p)
 			munmap(maps[p], mapsz[p]);
-		if (rc < 0)
-		{
-			static int v0warned = 0;
-			if (!v0warned++)
-				eWarning("[histb-dec] V0 sws_scale failed: %d", rc);
-			return false;
-		}
-		int ret = drmModeSetPlane(m_fd, m_v0_plane_id, m_crtc_id, m_v0_fb,
-			0, 0, 0, m_width, m_height,
-			0, 0, width << 16, height << 16);
-		if (ret < 0)
-		{
-			static int spwarned = 0;
-			if (!spwarned++)
-				eWarning("[histb-dec] drmModeSetPlane(V0) failed: %s", strerror(errno));
-			return false;
-		}
-		if (!m_v0_presented)
-		{
-			m_v0_presented = true;
-			eDebug("[histb-dec] first V0 frame presented %dx%d -> %dx%d",
-				width, height, m_width, m_height);
-		}
-		return true;
+		return presentV0(width, height);
 	}
 
-	/* software frame -> NV12 dumb buffer -> V0 plane (plain copy for
-	 * NV12 sources, format conversion for YUV420P) */
+	/* software frame -> NV12 dumb buffer -> V0 plane (format conversion
+	 * for YUV420P and friends via sws, double-buffered like the PRIME
+	 * dumb path) */
 	bool showFrameSwV0(const AVFrame *f)
 	{
 		if (!initV0Path(f->width, f->height))
@@ -1258,8 +1303,9 @@ private:
 			AV_PIX_FMT_NV12, SWS_BILINEAR, nullptr, nullptr, nullptr);
 		if (!m_v0_sws)
 			return false;
-		uint8_t *dst[4] = {m_v0_map, m_v0_map + m_v0_yoff, nullptr, nullptr};
-		int dststrides[4] = {(int)m_v0_pitch, (int)m_v0_pitch, 0, 0};
+		V0Buf &b = m_v0_buf[m_v0_wr];
+		uint8_t *dst[4] = {b.map, b.map + b.yoff, nullptr, nullptr};
+		int dststrides[4] = {(int)b.pitch, (int)b.pitch, 0, 0};
 		if (sws_scale(m_v0_sws, f->data, f->linesize, 0, f->height, dst, dststrides) < 0)
 		{
 			static int swwarned = 0;
@@ -1267,22 +1313,88 @@ private:
 				eWarning("[histb-dec] V0 sw frame copy failed");
 			return false;
 		}
-		int ret = drmModeSetPlane(m_fd, m_v0_plane_id, m_crtc_id, m_v0_fb,
-			0, 0, 0, m_width, m_height,
-			0, 0, (uint32_t)f->width << 16, (uint32_t)f->height << 16);
-		if (ret < 0)
-		{
-			static int spwarned = 0;
-			if (!spwarned++)
-				eWarning("[histb-dec] drmModeSetPlane(V0, sw) failed: %s", strerror(errno));
-			return false;
-		}
 		if (!m_v0_presented)
 		{
+			/* log before presentV0 so the first-frame line keeps its
+			 * position relative to the dumb-path one */
 			m_v0_presented = true;
 			eDebug("[histb-dec] first sw NV12 frame on V0 %dx%d", f->width, f->height);
 		}
-		return true;
+		return presentV0(f->width, f->height);
+	}
+
+	/* switch the display refresh rate to an integer multiple of the
+	 * video frame rate (25fps -> 50Hz, 30fps -> 60Hz, never 25Hz):
+	 * running 25fps broadcast on a fixed 60Hz panel gives a 2:2:2:2:3
+	 * cadence with a long frame every 200ms, perceived as periodic
+	 * stutter; same geometry keeps the OSD untouched */
+	void adaptToFrameRate(int ticks)
+	{
+		if (ticks <= 0 || m_fd < 0 || !m_conn_id || !m_mode.clock)
+			return;
+		int fps = (90000 + ticks / 2) / ticks;
+		int desired = fps <= 33 ? fps * 2 : fps;
+		int curdiff = (int)m_mode.vrefresh - desired;
+		if (curdiff < 0)
+			curdiff = -curdiff;
+		if (curdiff <= 1)
+			return;
+		drmModeConnectorPtr conn = drmModeGetConnector(m_fd, m_conn_id);
+		if (!conn)
+			return;
+		const drmModeModeInfo *best = nullptr;
+		int bestdiff = curdiff;
+		for (int m = 0; m < conn->count_modes; ++m)
+		{
+			const drmModeModeInfo &cand = conn->modes[m];
+			if (cand.hdisplay != m_mode.hdisplay || cand.vdisplay != m_mode.vdisplay)
+				continue;
+			int d = (int)cand.vrefresh - desired;
+			if (d < 0)
+				d = -d;
+			if (d < bestdiff)
+			{
+				bestdiff = d;
+				best = &cand;
+			}
+		}
+		uint32_t fb = 0;
+		if (best && m_osd_plane_id)
+		{
+			/* re-bind whatever fb the OSD/primary plane shows now */
+			drmModePlanePtr plane = drmModeGetPlane(m_fd, m_osd_plane_id);
+			if (plane)
+			{
+				fb = plane->fb_id;
+				drmModeFreePlane(plane);
+			}
+		}
+		if (best && fb)
+		{
+			drmModeModeInfo nm = *best;
+			int ret = drmModeSetCrtc(m_fd, m_crtc_id, fb, 0, 0, &m_conn_id, 1, &nm);
+			if (ret == 0)
+			{
+				eDebug("[histb-dec] display %dx%d@%u -> %u Hz (video %d fps)",
+					m_mode.hdisplay, m_mode.vdisplay, m_mode.vrefresh,
+					nm.vrefresh, fps);
+				m_mode = nm;
+			}
+			else
+			{
+				static int mw = 0;
+				if (!mw++)
+					eWarning("[histb-dec] refresh rate switch to %u Hz failed: %s",
+						nm.vrefresh, strerror(errno));
+			}
+		}
+		else if (best && !fb)
+		{
+			static int nw = 0;
+			if (!nw++)
+				eDebug("[histb-dec] refresh rate switch skipped: primary fb unknown");
+		}
+		drmModeFreeConnector(conn);
 	}
 
 	/* software frame -> XRGB8888 dumb buffer -> legacy CRTC */
@@ -1552,10 +1664,21 @@ private:
 	struct SwsContext *m_sws = nullptr;
 	/* V0 hardware video plane state */
 	uint32_t m_v0_plane_id = 0;
-	uint32_t m_v0_fb = 0, m_v0_handle = 0, m_v0_pitch = 0, m_v0_yoff = 0;
 	uint32_t m_v0_w = 0, m_v0_h = 0;
-	size_t m_v0_size = 0;
-	uint8_t *m_v0_map = nullptr;
+	/* two NV12 dumb buffers double-buffered against scanout: write the
+	 * back buffer, SetPlane it, then swap; a single buffer would be
+	 * rewritten while the VDP is still scanning it out */
+	struct V0Buf
+	{
+		uint32_t fb = 0, handle = 0, pitch = 0, yoff = 0;
+		size_t size = 0;
+		uint8_t *map = nullptr;
+	};
+	V0Buf m_v0_buf[2];
+	int m_v0_wr = 0;
+	/* frame presentation stats (logged every N frames) */
+	std::atomic<unsigned> m_v0_frames{0};
+	std::atomic<unsigned> m_v0_setplane_max_us{0};
 	struct SwsContext *m_v0_sws = nullptr;
 	bool m_v0_inited = false;
 	bool m_v0_presented = false;
@@ -2206,6 +2329,14 @@ private:
 				if (f->sample_aspect_ratio.num && f->sample_aspect_ratio.den)
 					m_aspect = f->sample_aspect_ratio.num > f->sample_aspect_ratio.den ? 1 : 0; /* 1 = 16:9 */
 				m_framerate = m_avctx->framerate.den ? (int)(90000LL * m_avctx->framerate.num / m_avctx->framerate.den) : 0;
+				if (m_framerate && m_framerate != m_adapted_framerate)
+				{
+					/* pick a display refresh that is an integer
+					 * multiple of the video rate before the first
+					 * frame lands on the plane */
+					m_adapted_framerate = m_framerate;
+					m_drm.adaptToFrameRate(m_framerate);
+				}
 			}
 			m_progressive = progressive;
 			struct iTSMPEGDecoder::videoEvent ev;
@@ -2252,6 +2383,7 @@ private:
 	bool m_first_frame = false;
 	std::atomic<bool> m_frozen{false};
 	int64_t m_last_pts = -1;
+	int m_adapted_framerate = 0;
 	int m_width = 0, m_height = 0, m_framerate = 0, m_aspect = 0, m_progressive = 0;
 	std::function<void(const struct iTSMPEGDecoder::videoEvent &)> m_event_sink;
 	int m_evpipe[2] = {-1, -1};
