@@ -1147,7 +1147,11 @@ private:
 		drmModeObjectPropertiesPtr props =
 			drmModeObjectGetProperties(m_fd, m_v0_plane_id, DRM_MODE_OBJECT_PLANE);
 		if (!props)
+		{
+			eDebug("[histb-dec] V0 props: ObjectGetProperties failed: %s", strerror(errno));
 			return false;
+		}
+		unsigned count = props->count_props;
 		for (unsigned int i = 0; i < props->count_props; ++i)
 		{
 			drmModePropertyPtr p = drmModeGetProperty(m_fd, props->props[i]);
@@ -1181,6 +1185,7 @@ private:
 		m_v0_props.valid = m_v0_props.fb_id && m_v0_props.crtc_id &&
 			m_v0_props.src_w && m_v0_props.src_h &&
 			m_v0_props.crtc_w && m_v0_props.crtc_h;
+		eDebug("[histb-dec] V0 props: count=%u valid=%d", count, m_v0_props.valid ? 1 : 0);
 		return m_v0_props.valid;
 	}
 
