@@ -1,0 +1,34 @@
+name: cleanup-runs
+
+# Manual trigger only: prune historical workflow runs, keep the newest 3.
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Delete old workflow runs (keep newest 3)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          # List all completed runs newest-first (API default order), skip
+          # the 3 newest, delete the rest.  In-progress runs are left alone
+          # so an active build is never killed; a later cleanup catches them.
+          OLD=$(gh api --paginate "repos/${REPO}/actions/runs" \
+            --jq '.workflow_runs[] | select(.status == "completed") | .id' \
+            | tail -n +4)
+          total=0
+          for id in ${OLD}; do
+            if gh api -X DELETE "repos/${REPO}/actions/runs/${id}"; then
+              total=$((total + 1))
+            else
+              echo "::warning::failed to delete run ${id}"
+            fi
+            sleep 0.3
+          done
+          echo "deleted ${total} runs"
