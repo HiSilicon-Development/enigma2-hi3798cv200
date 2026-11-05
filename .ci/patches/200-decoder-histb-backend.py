@@ -14,7 +14,7 @@ import shutil
 # Install every local backend dependency even when the source is already wired.
 packaging = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'packaging')
 for header in ('decoder_histb_impl.h', 'histb_video_capture_impl.h',
-               'histb_audio_control.h'):
+               'histb_audio_control.h', 'histb_video_entry.h'):
     shutil.copy(os.path.join(packaging, header), os.path.join('lib/dvb', header))
 
 # Source wiring is independent of the refreshed implementation headers.

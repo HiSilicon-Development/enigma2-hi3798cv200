@@ -68,6 +68,7 @@
 #include <lib/dvb/decoder.h>
 #include <lib/driver/histb_drm.h>
 #include <lib/dvb/histb_audio_control.h>
+#include <lib/dvb/histb_video_entry.h>
 
 /* ------------------------------------------------------------------ */
 /* hivxe-ffmpeg loaded with dlopen so enigma2 stays startable without  */
@@ -3210,37 +3211,6 @@ public:
 	}
 
 private:
-	/* parameter sets or a picture to start the decoding with */
-	bool entryPoint(const uint8_t *es, size_t length) const
-	{
-		for (size_t i = 0; i + 3 < length; ++i)
-		{
-			if (es[i] || es[i + 1] || es[i + 2] != 1)
-				continue;
-			uint8_t code = es[i + 3];
-			switch (m_codec_type)
-			{
-			case AV_CODEC_ID_MPEG2VIDEO:
-			case AV_CODEC_ID_MPEG1VIDEO:
-				return code == 0xb3; /* sequence header */
-			case AV_CODEC_ID_H264:
-				return (code & 0x1f) == 7 || (code & 0x1f) == 5; /* SPS or IDR */
-			case AV_CODEC_ID_HEVC:
-			{
-				int t = (code >> 1) & 0x3f;
-				return (t >= 16 && t <= 21) || t == 32 || t == 33; /* IRAP/VPS/SPS */
-			}
-			case AV_CODEC_ID_CAVS:
-				/* CAVS start codes (cavs.h): 0xB0 sequence header,
-				 * 0xB3 I-picture; either is a random access point */
-				return code == 0xb0 || code == 0xb3;
-			default:
-				return true;
-			}
-		}
-		return false;
-	}
-
 	void feedPes(const uint8_t *es, size_t len, int64_t pts, bool random_access)
 	{
 		std::lock_guard<std::mutex> lock(m_decode_mutex);
@@ -3262,7 +3232,7 @@ private:
 		}
 		if (!m_synced)
 		{
-			if (random_access || entryPoint(es, len))
+			if (random_access || histbVideoEntryPoint(m_codec_type, es, len))
 			{
 				m_synced = true;
 				eDebug("[histb-dec] video entry point found after %u pes packets%s",
