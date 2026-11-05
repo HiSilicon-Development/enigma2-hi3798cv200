@@ -112,7 +112,51 @@
  
  config.av = ConfigSubsection()
  config.av.edid_override = ConfigYesNo(default=False)
-@@ -1024,6 +1025,7 @@
+@@ -902,6 +903,34 @@
+ 	else:
+ 		config.av.scaler_sharpness = NoSave(ConfigNothing())
+ 	avSwitch.setConfiguredMode()
++
++
++class VideoModeConfig(ConfigSubDict):
++	# Keep saved selections for disconnected outputs without advertising them as choices.
++	def __init__(self):
++		ConfigSubDict.__init__(self)
++		self.inactive = {}
++
++	def updateChoices(self, choices):
++		for key in list(self):
++			if key not in choices:
++				self.inactive[key] = self.pop(key)
++		for key, values in choices.items():
++			if key not in self:
++				if key in self.inactive:
++					dict.__setitem__(self, key, self.inactive.pop(key))
++				else:
++					self[key] = ConfigSelection(choices=values)
++			self[key].setChoices(values)
++
++	def getSavedValue(self):
++		values = {key: value for key, value in self.stored_values.items() if key not in self and key not in self.inactive}
++		values.update({key: item.saved_value for key, item in self.inactive.items() if item.saved_value is not None})
++		values.update(ConfigSubDict.getSavedValue(self))
++		return values
++
++	savedValue = property(getSavedValue, ConfigSubDict.setSavedValue)
++	saved_value = property(getSavedValue, ConfigSubDict.setSavedValue)
+ 
+ 
+ class AVSwitchBase:
+@@ -999,6 +1028,8 @@
+ 		"Multi"
+ 	]
+ 	modes["HDMI"] = ["720p", "1080p", "smpte", "2160p30", "2160p", "1080i", "576p", "576i", "480p", "480i"]
++	if HISTB:
++		modes["HDMI"].remove("2160p30")  # A raw 30 Hz timing, not a second UHD resolution.
+ 	modes["YPbPr"] = modes["HDMI"]
+ 	if BoxInfo.getItem("scartyuv", False):
+ 		modes["Scart-YPbPr"] = modes["HDMI"]
+@@ -1024,6 +1055,7 @@
  		self.on_hotplug = CList()
  		self.current_mode = None
  		self.current_port = None
@@ -120,7 +164,109 @@
  		print(f"[AVSwitch] getAvailableModes: '{eAVControl.getInstance().getAvailableModes()}'.")
  		self.is24hzAvailable()
  		self.readPreferredModes()
-@@ -1226,7 +1228,17 @@
+@@ -1082,42 +1114,64 @@
+ 
+ 		return self.axis.get(mode, self.axis["720p"])
+ 
++	def migrateLegacyUhdConfig(self):
++		# Migrate the saved baseline before ConfigSelection validates its choices, so
++		# cancel/load cannot resurrect the removed group or discard its refresh rate.
++		saved = config.av.saved_value
++		for modeName, rateName in (("videomode", "videorate"),) + tuple(
++			(f"autores_mode_{kind}", f"autores_rate_{kind}") for kind in ("sd", "hd", "fhd", "uhd")
++		):
++			modes = saved.get(modeName, {})
++			rates = saved.get(rateName, {})
++			legacyRate = rates.pop("2160p30", "25Hz")
++			if "2160p30" in modes.values():
++				for port in modes:
++					if modes[port] == "2160p30":
++						modes[port] = "2160p"
++				# HiSTB applied the first cadence slot of legacy multi/auto: 25 Hz.
++				# Do not reinterpret those settings as the canonical 50/60 Hz pair.
++				rates["2160p"] = "25Hz" if legacyRate in ("multi", "auto") else legacyRate
++				saved[rateName] = rates
++
+ 	def createConfig(self, *args):
+-		config.av.videomode = ConfigSubDict()
+-		config.av.autores_mode_sd = ConfigSubDict()
+-		config.av.autores_mode_hd = ConfigSubDict()
+-		config.av.autores_mode_fhd = ConfigSubDict()
+-		config.av.autores_mode_uhd = ConfigSubDict()
+-		config.av.videorate = ConfigSubDict()
+-		config.av.autores_rate_sd = ConfigSubDict()
+-		config.av.autores_rate_hd = ConfigSubDict()
+-		config.av.autores_rate_fhd = ConfigSubDict()
+-		config.av.autores_rate_uhd = ConfigSubDict()
++		modeNames = ("videomode", "autores_mode_sd", "autores_mode_hd", "autores_mode_fhd", "autores_mode_uhd")
++		rateNames = ("videorate", "autores_rate_sd", "autores_rate_hd", "autores_rate_fhd", "autores_rate_uhd")
++		if HISTB:
++			if not hasattr(config.av, "videomode"):
++				self.migrateLegacyUhdConfig()
++			for name in modeNames + rateNames:
++				if not hasattr(config.av, name):
++					setattr(config.av, name, VideoModeConfig())
++		else:
++			for name in modeNames + rateNames:
++				setattr(config.av, name, ConfigSubDict())
+ 		portList = []  # Create list of output ports.
++		modeChoices = {}
++		rateChoices = {}
+ 		for port in self.getPortList():
+ 			if "HDMI" in port:
+ 				portList.insert(0, (port, port))
+ 			else:
+ 				portList.append((port, port))
+ 			modes = self.getModeList(port)
+-			if len(modes):
+-				config.av.videomode[port] = ConfigSelection(choices=[mode for (mode, rates) in modes])
+-				config.av.autores_mode_sd[port] = ConfigSelection(choices=[mode for (mode, rates) in modes])
+-				config.av.autores_mode_hd[port] = ConfigSelection(choices=[mode for (mode, rates) in modes])
+-				config.av.autores_mode_fhd[port] = ConfigSelection(choices=[mode for (mode, rates) in modes])
+-				config.av.autores_mode_uhd[port] = ConfigSelection(choices=[mode for (mode, rates) in modes])
+-			for (mode, rates) in modes:
+-				rateList = []
+-				for rate in rates:
+-					if rate == "auto" and not BoxInfo.getItem("have24hz"):
+-						continue
+-					rateList.append((rate, rate))
+-				config.av.videorate[mode] = ConfigSelection(choices=rateList)
+-				config.av.autores_rate_sd[mode] = ConfigSelection(choices=rateList)
+-				config.av.autores_rate_hd[mode] = ConfigSelection(choices=rateList)
+-				config.av.autores_rate_fhd[mode] = ConfigSelection(choices=rateList)
+-				config.av.autores_rate_uhd[mode] = ConfigSelection(choices=rateList)
+-		config.av.videoport = ConfigSelection(choices=portList)
++			if modes:
++				modeChoices[port] = [mode for mode, rates in modes]
++			for mode, rates in modes:
++				rateChoices[mode] = [(rate, rate) for rate in rates]
++		for names, choices in ((modeNames, modeChoices), (rateNames, rateChoices)):
++			for name in names:
++				settings = getattr(config.av, name)
++				if HISTB:
++					settings.updateChoices(choices)
++				else:
++					for key, values in choices.items():
++						settings[key] = ConfigSelection(choices=values)
++		if HISTB and hasattr(config.av, "videoport"):
++			config.av.videoport.setChoices(portList)
++		else:
++			config.av.videoport = ConfigSelection(choices=portList)
++		if HISTB and hasattr(config.av, "aspectswitch"):
++			return
+ 		config.av.aspectswitch = ConfigSubsection()
+ 		config.av.aspectswitch.enabled = ConfigYesNo(default=False)
+ 		defaults = (  # The preset values for the offset heights.
+@@ -1172,7 +1226,7 @@
+ 		results = []
+ 		availableModes = self.readAvailableModes()
+ 		for mode in self.modes[port]:
+-			rates = [rate for rate in self.rates[mode] if self.isModeAvailable(port, mode, rate, availableModes)]  # List all rates which are completely valid.
++			rates = [rate for rate in self.rates[mode] if (rate != "auto" or BoxInfo.getItem("have24hz")) and self.isModeAvailable(port, mode, rate, availableModes)]  # List all rates which are completely valid.
+ 			if len(rates):  # If at least one rate is OK then add this mode.
+ 				results.append((mode, rates))
+ 		return results
+@@ -1226,7 +1280,17 @@
  		eAVControl.getInstance().setInput(input, 1)
  
  	def setVideoModeDirect(self, mode):
@@ -139,7 +285,7 @@
  
  	def setMode(self, port, mode, rate, force=None):
  		print(f"[AVSwitch] Setting mode for port '{port}', mode '{mode}', rate '{rate}'.")
-@@ -1243,7 +1255,14 @@
+@@ -1243,7 +1307,14 @@
  			mode24 = mode60
  			if force == 50:
  				mode24 = mode50
@@ -155,7 +301,7 @@
  		if eAVControl.getInstance().hasVideoAxis():
  			limits = [int(x) for x in eAVControl.getInstance().getVideoAxis(mode).split()]
  			config.osd.dst_left.setChoices(default=limits[0], first=limits[0] - 255, last=limits[0] + 255)
-@@ -1254,6 +1273,7 @@
+@@ -1254,6 +1325,7 @@
  		self.setColorFormat(config.av.colorformat.value)
  		self.current_mode = mode
  		self.current_port = port
@@ -163,16 +309,18 @@
  
  	def setPolicy43(self, configElement):
  		eAVControl.getInstance().setPolicy43(configElement.value, 1)
-@@ -1265,6 +1285,8 @@
+@@ -1265,6 +1337,10 @@
  		eAVControl.getInstance().setWSS(configElement.value, 1)
  
  	def saveMode(self, port, mode, rate):
++		if HISTB and (port not in self.modes or not any(mode == candidate and rate in rates for candidate, rates in self.getModeList(port))):
++			return False
 +		if HISTB and not self.setMode(port, mode, rate):
 +			return False
  		config.av.videoport.value = port
  		config.av.videoport.save()
  		if port in config.av.videomode:
-@@ -1273,6 +1295,7 @@
+@@ -1273,6 +1349,7 @@
  		if mode in config.av.videorate:
  			config.av.videorate[mode].value = rate
  			config.av.videorate[mode].save()
@@ -180,12 +328,52 @@
  
  
  # This is a dummy class to stop the constant re-instantiation of the AVSwitchBase class!
+@@ -1304,6 +1381,9 @@
+ def InitiVideomodeHotplug(**kwargs):
+ 	global hotplug
+ 	hotplug = VideomodeHotplug()
++	if HISTB:
++		from Components.HistbVideoHotplug import HistbVideoHotplug
++		hotplug.monitor = HistbVideoHotplug(avSwitch)
+ 
+ 
+ class VideomodeHotplug:
+@@ -1319,6 +1399,8 @@
+ 	def hotplug(self, what):
+ 		print(f"[AVSwitch] Hot-plug detected on port '{what}'.")
+ 		port = config.av.videoport.value
++		if port not in config.av.videomode:
++			return  # A disconnected sink has no selectable modes.
+ 		mode = config.av.videomode[port].value
+ 		rate = config.av.videorate[mode].value
+ 		availableModes = avSwitch.readAvailableModes()
 --- a/lib/python/Screens/VideoMode.py
 +++ b/lib/python/Screens/VideoMode.py
-@@ -198,6 +198,14 @@
+@@ -53,7 +53,7 @@
+ 		items = [
+ 			(_("Video output"), config.av.videoport, _("Configures which video output connector will be used."))
+ 		]
+-		if port in ("HDMI", "YPbPr", "Scart-YPbPr") and not getAutoresPluginEnabled():
++		if port in config.av.videomode and port in ("HDMI", "YPbPr", "Scart-YPbPr") and not getAutoresPluginEnabled():
+ 			modes = avSwitch.readAvailableModes()
+ 			items.append((_("Automatic resolution"), config.av.autores, _("If enabled the output resolution of the receiver will try to match the resolution of the video contents resolution.")))
+ 			if config.av.autores.value in ("all", "hd"):
+@@ -122,7 +122,7 @@
+ 						items.append((_("%sShow 1080i as 1080p") % self.prevFhd, config.av.autores_1080i_deinterlace, _("Use Deinterlacing for 1080i Videosignal?"), "check_fhd"))
+ 					elif "1080p" not in modes and "1080p50" not in modes:
+ 						config.av.autores_1080i_deinterlace.value = False
+-				if "2160p" in modes or "2160p30" in modes:
++				if any(mode.startswith("2160p") for mode in config.av.videomode[port].choices):
+ 					self.getVerifyVideomode(config.av.autores_mode_uhd, config.av.autores_rate_uhd)
+ 					items.extend((
+ 						(pgettext(_("Video output mode for UHD"), _("%sMode for UHD (up to 2160p)") % self.prevUhd), config.av.autores_mode_uhd[port], _("This option configures the video output mode (or resolution)."), "check_uhd"),
+@@ -198,6 +198,17 @@
  			setrate[configMode].value = configRate
  
  	def confirm(self, confirmed):
++		if config.av.videoport.value not in config.av.videomode:
++			self.createSetup()
++			return
 +		if confirmed and BoxInfo.getItem("platform") == "hi3798cv200":
 +			port = config.av.videoport.value
 +			mode = config.av.videomode[port].value
@@ -197,18 +385,58 @@
  		if not confirmed:
  			if self.resetMode == 1:
  				config.av.videoport.value = self.lastGood[0]
-@@ -277,6 +285,10 @@
- 		else:
+@@ -231,6 +242,9 @@
+ 	def grabLastGoodMode(self):
+ 		self.resetMode = 0
+ 		port = config.av.videoport.value
++		if port not in config.av.videomode:
++			self.lastGood = None
++			return
+ 		mode = config.av.videomode[port].value
+ 		rate = config.av.videorate[mode].value
+ 		self.lastGood = (port, mode, rate)
+@@ -251,6 +265,11 @@
+ 
+ 	def keySave(self):
+ 		port = config.av.videoport.value
++		if port not in config.av.videomode:
++			Setup.keySave(self)
++			return
++		if self.lastGood is None:
++			self.grabLastGoodMode()
+ 		mode = config.av.videomode[port].value
+ 		rate = config.av.videorate[mode].value
+ 		autoresSd = config.av.autores_sd.value
+@@ -278,6 +297,10 @@
  			self.resetMode = 0
  			Setup.keySave(self)
-+			return
+ 			return
 +		if avSwitch.mode_apply_failed:
 +			self.confirm(False)
 +			self.session.open(MessageBox, _("The requested video mode was rejected by the display hardware. The previous settings have been restored."), MessageBox.TYPE_ERROR)
- 			return
++			return
  		if BoxInfo.getItem("machinebuild") == "gbquad4kpro" and mode.startswith("2160p"):  # Hack for GB QUAD 4K Pro!
  			config.av.hdmicolordepth.value = "10bit"
-@@ -785,9 +797,11 @@
+ 			config.av.hdmicolordepth.save()
+@@ -287,7 +310,7 @@
+ 		return eAVControl.getInstance().getVideoMode("") or None
+ 
+ 	def changedEntry(self):
+-		if config.av.autores_preview.value:
++		if config.av.autores_preview.value and config.av.videoport.value in config.av.videomode:
+ 			ConfigListScreen.changedEntry(self)
+ 			cur = self["config"].getCurrent()
+ 			cur = cur and len(cur) > 3 and cur[3]
+@@ -499,6 +522,8 @@
+ 	def VideoChangeDetect(self):
+ 		# Info: Auto resolution preview or save settings call this function with session = None / ~338, ~374.
+ 		global resolutionlabel
++		if config.av.videoport.value not in config.av.videomode:
++			return  # No sink: there is no configured timing to derive an output from.
+ 		avControl = eAVControl.getInstance()
+ 		configPort, configMode, configRes, configPol, configRate = self.getConfigVideomode(config.av.videomode, config.av.videorate)
+ 		configMode = configMode.replace("p30", "p")
+@@ -785,9 +810,11 @@
  					elif writeMode in ("2160p24", "2160p30", "2160p60"):
  						writeMode = "2160p"
  				if writeMode in values:
@@ -223,7 +451,7 @@
  				else:
  					print(f"[VideoMode] setMode - port: {configPort}, mode: {writeMode} is not available")
  					resolutionlabel["restxt"].setText(_("Video mode: %s not available") % writeMode)
-@@ -809,7 +823,9 @@
+@@ -809,7 +836,9 @@
  def manualResolution(session):  # Ad hoc video mode selection from the extensions menu.
  	def manualResolutionCallback(choice):
  		if choice and choice[1] != oldMode:
@@ -236,7 +464,16 @@
  	def confirmCallback(answer):
 --- a/lib/python/Screens/WizardVideo.py
 +++ b/lib/python/Screens/WizardVideo.py
-@@ -131,7 +131,8 @@
+@@ -85,8 +85,6 @@
+ 		for modes in avSwitch.getModeList(self.port):
+ 			if modes[0] == mode:
+ 				for rate in modes[1]:
+-					if rate == "auto" and not BoxInfo.getItem("have24hz"):
+-						continue
+ 					if self.port == "DVI-PC":
+ 						# print("[WizardVideo] listModes DEBUG: rate='%s'." % rate)
+ 						if rate == "640x480":
+@@ -131,7 +129,8 @@
  			return False
  		# listRates already prefers multi, but only if all required rates are available.
  		self.rate = rates[0][0]
@@ -246,7 +483,7 @@
  
  		if BoxInfo.getItem("machinebuild") == "gbquad4kpro" and mode.startswith("2160p"):  # Hack for GB QUAD 4K Pro
  			config.av.hdmicolordepth.value = "10bit"
-@@ -149,25 +150,24 @@
+@@ -149,25 +148,24 @@
  
  	def rateSelect(self, rate):
  		if any(item[0] == rate for item in self.listRates()):
@@ -280,7 +517,7 @@
  			avSwitch.setConfiguredMode()
  			self.close()
  		Wizard.keyNumberGlobal(self, number)
-@@ -179,7 +179,10 @@
+@@ -179,7 +177,10 @@
  		configfile.save()
  
  	def saveWizardChanges(self):  # Called by wizardvideo.xml.
@@ -294,18 +531,37 @@
  		config.misc.videowizardenabled.value = 0
 --- a/lib/python/Screens/WizardStart.py
 +++ b/lib/python/Screens/WizardStart.py
-@@ -478,7 +478,13 @@
+@@ -478,7 +478,14 @@
  			elif "1080p" in preferred:
  				self.mode = "1080p"
  
 -		self.setMode()
-+		if BoxInfo.getItem("platform") == "hi3798cv200" and "HDMI" in config.av.videomode:
-+			# Do not overwrite a saved KMS timing with the legacy 720p probe.
-+			self.mode = config.av.videomode["HDMI"].value
-+			avSwitch.setConfiguredMode()
-+			preferred = [self.mode]
++		if BoxInfo.getItem("platform") == "hi3798cv200":
++			# Do not overwrite a saved KMS timing or probe an absent sink.
++			if "HDMI" in config.av.videomode:
++				self.mode = config.av.videomode["HDMI"].value
++				avSwitch.setConfiguredMode()
++				preferred = [self.mode]
 +		else:
 +			self.setMode()
  
  		if not preferred:
  			ports = [port for port in avSwitch.getPortList() if avSwitch.isPortUsed(port)]
+@@ -487,6 +494,8 @@
+ 				print("[WizardLanguage] DEBUG start resolutionTimer")
+ 
+ 	def setMode(self):
++		if BoxInfo.getItem("platform") == "hi3798cv200" and "HDMI" not in config.av.videomode:
++			return
+ 		print(f"[WizardLanguage] DEBUG setMode {self.mode}")
+ 		if self.mode in ("720p", "1080p") and not BoxInfo.getItem("AmlogicFamily"):
+ 			rate = "multi"
+@@ -505,8 +514,6 @@
+ 		for modes in avSwitch.getModeList("HDMI"):
+ 			if modes[0] == self.mode:
+ 				for rate in modes[1]:
+-					if rate == "auto" and not BoxInfo.getItem("have24hz"):
+-						continue
+ 					rates.append((rate, rate))
+ 		rates.sort(key=sortKey)
+ 		return rates[0][0]

@@ -1,0 +1,118 @@
+--- /dev/null
++++ b/lib/python/Components/HistbVideoHotplug.py
+@@ -0,0 +1,115 @@
++from pathlib import Path
++from socket import AF_NETLINK, SOCK_DGRAM, socket
++
++from enigma import eServiceReference, eTimer
++from twisted.internet import reactor
++
++import NavigationInstance
++from Components.config import config
++
++
++class HistbVideoHotplug:
++	"""Feed real DRM hotplug transitions into the existing OpenATV mode model."""
++
++	def __init__(self, avSwitch):
++		self.avSwitch = avSwitch
++		self.sock = None
++		self.timer = eTimer()
++		self.timer.callback.append(self.refresh)
++		self.state = self.readState()
++		try:
++			# Linux NETLINK_KOBJECT_UEVENT is not named by Python's socket module.
++			self.sock = socket(AF_NETLINK, SOCK_DGRAM, 15)
++			self.sock.bind((0, 1))
++			self.sock.setblocking(False)
++			reactor.addReader(self)
++			print("[HistbVideoHotplug] Listening for kernel DRM hotplug events.")
++		except OSError as error:
++			self.close()
++			print(f"[HistbVideoHotplug] Cannot monitor HDMI: {error}")
++
++	def fileno(self):
++		return self.sock.fileno() if self.sock else -1
++
++	def logPrefix(self):
++		return "HistbVideoHotplug"
++
++	def doRead(self):
++		while self.sock is not None:
++			try:
++				data, sender = self.sock.recvfrom(65536)
++			except BlockingIOError:
++				break
++			fields = data.split(b"\0")
++			if sender[0] == 0 and b"SUBSYSTEM=drm" in fields and b"HOTPLUG=1" in fields:
++				# Coalesce one kernel hotplug burst; do not poll or retry modesets.
++				self.timer.start(250, True)
++
++	def connectionLost(self, failure=None):
++		self.close()
++		print(f"[HistbVideoHotplug] HDMI event monitor stopped: {failure}")
++
++	def close(self):
++		self.timer.stop()
++		if self.sock is not None:
++			reactor.removeReader(self)
++			self.sock.close()
++			self.sock = None
++
++	@staticmethod
++	def readState():
++		state = []
++		for path in sorted(Path("/sys/class/drm").glob("card*-HDMI-A-*/status")):
++			try:
++				state.append((str(path), path.read_text().strip(), path.with_name("edid").read_bytes()))
++			except OSError as error:
++				print(f"[HistbVideoHotplug] Cannot read connector state: {error}")
++		return tuple(state)
++
++	def refresh(self):
++		# getPreferredModes re-probes KMS/EDID. Notify consumers only after their
++		# shared ConfigSelections have been refreshed, preserving save/cancel.
++		self.avSwitch.readPreferredModes(readOnly=True)
++		state = self.readState()
++		if state == self.state:
++			return
++		wasConnected = any(status == "connected" for path, status, edid in self.state)
++		connected = any(status == "connected" for path, status, edid in state)
++		self.state = state
++		self.avSwitch.createConfig()
++		self.avSwitch.last_modes_preferred = self.avSwitch.modes_preferred[:]
++		port = config.av.videoport.value
++		if not connected:
++			print("[HistbVideoHotplug] HDMI disconnected; E2 and WebIF remain running.")
++			self.avSwitch.on_hotplug("HDMI")
++			return
++		if port != "HDMI" or port not in config.av.videomode:
++			print("[HistbVideoHotplug] No available HDMI mode; output was not changed.")
++			self.avSwitch.on_hotplug("HDMI")
++			return
++		mode = config.av.videomode[port].value
++		rate = config.av.videorate[mode].value
++		if not self.avSwitch.setMode(port, mode, rate):
++			print("[HistbVideoHotplug] HDMI mode was rejected; E2 remains running.")
++			self.avSwitch.on_hotplug("HDMI")
++			return
++		self.avSwitch.on_hotplug("HDMI")
++		print(f"[HistbVideoHotplug] HDMI restored: {mode} {rate}; E2 was not restarted.")
++		from Screens.Standby import inStandby
++		if inStandby:
++			if not wasConnected:
++				print("[HistbVideoHotplug] Physical HDMI connection wakes software standby.")
++				inStandby.Power()
++			return
++		navigation = NavigationInstance.instance
++		ref = navigation and navigation.getCurrentlyPlayingServiceReference()
++		if ref is None or ref.type != eServiceReference.idDVB or ref.getPath():
++			return
++		service = navigation.getCurrentService()
++		timeshift = service and service.timeshift()
++		if timeshift and timeshift.isTimeshiftEnabled():
++			print("[HistbVideoHotplug] Preserving the active timeshift buffer; no service restart.")
++			return
++		# Recover HDMI video/PCM that could not open while the sink was absent.
++		# This restarts only live playback, not E2, recordings or file playback.
++		navigation.restartService()
