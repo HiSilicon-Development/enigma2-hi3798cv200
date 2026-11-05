@@ -62,6 +62,13 @@ systemctl start e2.service
 - `0002-histb-use-actual-framebuffer-geometry.patch`：使用 fbdev 实际模式、stride 和图形上下文尺寸，
   防止被拒绝的 720p 请求把 1080p OSD 限制在左上角，或把仍在使用的 framebuffer 区域误作空闲内存。
 - `0003-persist-video-wizard-exit.patch`：确认退出视频向导后记录完成状态，避免每次启动重复进入。
+- `0004-decode-raw-device-labels.patch`：sysfs 的 eMMC/磁盘标识可能包含非 UTF-8 原始字节；
+  设备描述读取保留有效字符并替换不可解码字节，不让硬件标签导致整个 UI 启动失败。
+- `0005-histb-display-mode-geometry.patch`：以实际 KMS timing 应用视频模式，保持皮肤的
+  逻辑桌面和字体比例；确认、取消和失败恢复不以模拟节点内容判断成功。
+- `0006-openatv-ui-capabilities.patch`：全局设置跟踪暂时隐藏的依赖项，保存失败保留编辑值与
+  原取消目标；网络、时间、语言、皮肤和硬件能力使用真实后端并传播失败。
+- `0007-histb-pcm-volume.patch`：把音量和静音应用到 HDMI PCM 样本，不假定存在 Master mixer。
 
 打包器同时修正空运行库包、私有 Python 模块的无版本 SONAME、皮肤的绝对字体路径，
 并移除冒充 OE 固件镜像的分区 / 刷机元数据。`BOXTYPE` / `MACHINEBUILD` 仍使用上游 `u5` 兼容路径，
@@ -73,10 +80,11 @@ systemctl start e2.service
 `n9.0.1-33-g6c2ae2fd24-hivxe`。本地交叉编译后安装实机，已观察中文 UI、1080p framebuffer、
 OpenWebif 与网页遥控，并实际检查首次时区初始化和升级保留配置。未声称本次运行过完整 GitHub CI。
 
-- 当前实机未暴露 `/dev/dvb`，因此没有验收调谐器、搜台、DVB 直播和录制。
+- 该次 1001 实机未暴露 `/dev/dvb`，因此当时没有验收调谐器、搜台、DVB 直播和录制。
 - 移植解码后端依赖真实 DVB demux；安装了 hivxe-ffmpeg 不等于所有文件 / IPTV 路径已接上硬解。
   类型 4097 的播放服务仍走 GStreamer，不能据此宣称已验证 HiSTB 解码器。
 - 遥控接收器可被枚举；实体遥控器还需要匹配实际协议和 scancode 的 RC-core keymap，本次未验收实体按键。
 - OpenWebif 页面截图未通过本次验收。图像证据取自 `/dev/fb0`，不代表已实现视频层截取。
-- 现有 `/var/stb` 适配节点不是 DRM 分辨率、音量等硬件控制的完整实现。保持现有显示模式启动，
-  不应把设置菜单中出现选项当成对应硬件能力已完成。
+- `/var/stb` 仍承接音量、颜色等未实现的传统 STB 节点；视频模式查询和设置现由上述
+  KMS 后端接管。菜单出现选项仍不等于其他硬件控制已经实现；当前 1006 的通过项与
+  仍待恢复采集卡后完成的验收，以上面的实测记录为准。
