@@ -802,6 +802,7 @@ public:
 				0, 0, 0, 0, 0, 0, 0, 0, 0);
 		retireFrame();
 		releasePrimeItem(m_prime_onscreen);
+		releasePrimeItem(m_prime_prev);
 		m_fb_bound = false;
 	}
 
@@ -1146,6 +1147,7 @@ private:
 			}
 			m_prime_queue.push_back(it);
 		}
+		m_present_cv.notify_one();
 		if (!m_prime_presented)
 		{
 			m_prime_presented = true;
@@ -1427,6 +1429,7 @@ private:
 				m_prime_queue.pop_front();
 			}
 			releasePrimeItem(m_prime_onscreen);
+			releasePrimeItem(m_prime_prev);
 		}
 	}
 
@@ -1613,6 +1616,14 @@ private:
 	enum { kPrimeQueueMax = 12 }; /* ~480 ms of burst absorption at 25 fps */
 	std::deque<PrimeItem> m_prime_queue;
 	PrimeItem m_prime_onscreen; /* fb==0: nothing on screen */
+	/* the fb one flip behind m_prime_onscreen: legacy SetPlane only
+	 * queues for the next vblank, so the previous on-screen fb may
+	 * still be scanned out when the next commit returns - releasing
+	 * it there deadlocks the vendor drm driver in RmFB (it waits for
+	 * the fb to leave scanout, which needs the flip that never comes
+	 * because the modeset lock is held).  Release it one commit
+	 * later instead - same two-flip deferral the inline path had. */
+	PrimeItem m_prime_prev;
 
 	/* present-thread side: release a staged or retired PRIME item */
 	void releasePrimeItem(PrimeItem &it)
@@ -1720,10 +1731,12 @@ private:
 			{
 				if (prime)
 				{
-					/* pit is on screen now; the previously displayed
-					 * PRIME fb left scanout (one-flip deferral, same
-					 * as the old inline path) */
-					releasePrimeItem(m_prime_onscreen);
+					/* pit is on screen now; release the fb from
+					 * two flips ago (it left scanout at the
+					 * previous vblank), shift the deferral
+					 * chain - see m_prime_prev */
+					releasePrimeItem(m_prime_prev);
+					m_prime_prev = m_prime_onscreen;
 					m_prime_onscreen = pit;
 				}
 				else
