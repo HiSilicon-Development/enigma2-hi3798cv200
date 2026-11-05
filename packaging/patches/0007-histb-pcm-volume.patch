@@ -1,0 +1,49 @@
+diff --git a/lib/dvb/volume.cpp b/lib/dvb/volume.cpp
+index d3de201..3205cb5 100644
+--- a/lib/dvb/volume.cpp
++++ b/lib/dvb/volume.cpp
+@@ -1,6 +1,9 @@
+ #include <lib/base/cfile.h>
+ #include <lib/base/eerror.h>
+ #include <lib/dvb/volume.h>
++#ifdef HAVE_HISTB
++#include <lib/dvb/histb_audio_control.h>
++#endif
+ #include <stdio.h>
+ #include <fcntl.h>
+ #include <math.h>
+@@ -375,7 +378,9 @@ int eDVBVolumecontrol::setVolume(int left, int right)
+ 
+ 	m_BaseVolume = (m_VolumeOffset != 0) ? checkVolume(leftVol - m_VolumeOffset) : leftVol;
+ 
+-#ifdef HAVE_ALSA
++#ifdef HAVE_HISTB
++	histbSetPcmVolume(leftVol, rightVol);
++#elif defined(HAVE_ALSA)
+ 	eDebug("[eDVBVolumecontrol] Setvolume: ALSA leftVol=%d", leftVol);
+ #ifdef DREAMNEXTGEN
+ 	/* HW Master applies to all paths going through default→softvol→dmix. */
+@@ -464,7 +469,10 @@ int eDVBVolumecontrol::setVolume(int left, int right)
+  */
+ void eDVBVolumecontrol::volumeMute()
+ {
+-#ifdef HAVE_ALSA
++#ifdef HAVE_HISTB
++	muted = true;
++	histbSetPcmMute(true);
++#elif defined(HAVE_ALSA)
+ 	eDebug("[eDVBVolumecontrol] Set volume ALSA Mute.");
+ #ifdef DREAMNEXTGEN
+ 	muted = true;
+@@ -516,7 +524,10 @@ void eDVBVolumecontrol::volumeMute()
+  */
+ void eDVBVolumecontrol::volumeUnMute()
+ {
+-#ifdef HAVE_ALSA
++#ifdef HAVE_HISTB
++	muted = false;
++	histbSetPcmMute(false);
++#elif defined(HAVE_ALSA)
+ 	eDebug("[eDVBVolumecontrol] Set volume ALSA unMute to L=%d.", leftVol);
+ #ifdef DREAMNEXTGEN
+ 	muted = false;
