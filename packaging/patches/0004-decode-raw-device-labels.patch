@@ -1,0 +1,12 @@
+diff --git a/lib/python/Components/Harddisk.py b/lib/python/Components/Harddisk.py
+--- a/lib/python/Components/Harddisk.py
++++ b/lib/python/Components/Harddisk.py
+@@ -35,7 +35,7 @@
+ 	return False
+ 
+ def readFile(filename):
+-	with open(filename) as fd:
++	with open(filename, encoding="utf-8", errors="replace") as fd:
+ 		data = fd.read().strip()
+ 	return data
+ 
