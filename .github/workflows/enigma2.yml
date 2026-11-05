@@ -1376,6 +1376,12 @@ jobs:
           # 系统 stdlib /usr/lib/python3.13 → builtin 集合不匹配缺 math。
           # export 后 enigma2 不再覆盖, 强制使用自带 /usr/local/lib/python3.13。
           export PYTHONHOME=/usr/local
+          # 自带 libpython 优先: 一旦系统带入 libpython3.13（如 apt install gdb
+          # 的依赖链），ldconfig 缓存中 /lib/aarch64-linux-gnu 先于
+          # /usr/local/lib，enigma2.bin 会被劫持到系统库 → prefix=/usr →
+          # 系统 stdlib/site.py → 自带 site-packages（twisted/pyusb/CT3/PIL）
+          # 失联 → BSOD 崩溃循环。显式 LD_LIBRARY_PATH 锁定自带库。
+          export LD_LIBRARY_PATH=/usr/local/lib
           BIN=/usr/local/bin/enigma2.bin
           # NetworkManager 的 /var/run/netinfo 数据源（链路/网速/流量/因特网
           # 检测），E2 启动前拉起；daemon 自身绑定固定 socket，重复启动
