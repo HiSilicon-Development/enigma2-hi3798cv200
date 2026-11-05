@@ -1,0 +1,41 @@
+#!/bin/sh
+# OpenATV application supervisor; preserve UI exit-code semantics on Debian.
+BIN=/usr/local/bin/enigma2.bin
+export PYTHONUTF8=1
+if [ -f /usr/local/lib/enigma2/bundled-python3.13 ]; then
+    if [ ! -f /usr/local/lib/libpython3.13.so.1.0 ] || [ ! -d /usr/local/lib/python3.13 ]; then
+        echo 'Enigma2 bundled Python payload is incomplete' >&2
+        exit 1
+    fi
+    export PYTHONHOME=/usr/local
+    export LD_LIBRARY_PATH=/usr/local/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+fi
+
+start-stop-daemon -S -b -x /usr/local/bin/socketdaemon 2>/dev/null
+child=
+stop_child()
+{
+    trap - TERM INT
+    if [ -n "$child" ]; then
+        kill -TERM "$child" 2>/dev/null
+        wait "$child"
+    fi
+    start-stop-daemon -K -x /usr/local/bin/socketdaemon 2>/dev/null
+    exit 0
+}
+trap stop_child TERM INT
+while :; do
+    "$BIN" "$@" &
+    child=$!
+    wait "$child"
+    ret=$?
+    child=
+    case "$ret" in
+        1|45) poweroff 2>/dev/null || halt; break ;;
+        2) reboot; break ;;
+        3|5|6|15|16|17|42|43|44) ;;
+        *) break ;;
+    esac
+done
+start-stop-daemon -K -x /usr/local/bin/socketdaemon 2>/dev/null
+exit "$ret"

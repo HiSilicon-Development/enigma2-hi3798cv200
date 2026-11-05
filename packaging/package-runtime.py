@@ -166,18 +166,75 @@ def machine_identity(root):
     path.write_text(payload + f"checksum={md5(payload.encode('utf-8')).hexdigest()}\n")
 
 
+def prepare_runtime(root):
+    # Always install the executable behind the supervisor, including local
+    # incremental builds whose make install overwrote the wrapper path.
+    executable = root / "usr/local/bin/enigma2"
+    if elf(executable):
+        executable.replace(root / "usr/local/bin/enigma2.bin")
+    shutil.copy2(Path(__file__).with_name("enigma2"), executable)
+    executable.chmod(0o755)
+    marker = root / "usr/local/lib/enigma2/bundled-python3.13"
+    if (root / "usr/local/lib/libpython3.13.so.1.0").is_file():
+        if not (root / "usr/local/lib/python3.13").is_dir():
+            raise SystemExit("Bundled Python library requires its matching standard library")
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("3.13\n")
+    else:
+        marker.unlink(missing_ok=True)
+
+    # The OE default-skin package owns the complete fallback XML and fonts.
+    # Copying only its skin_default/ resource directory leaves root includes
+    # missing; the core's unrelated legacy skin_default.xml is not a substitute.
+    source = Path(os.environ.get("SKINDEFAULT_SOURCE_DIR", WORKSPACE / "skindefault"))
+    for relative in ("skin_default.xml", "skin.xml", "skinTemplates.xml", "prev.png", "skin_default/skin.xml"):
+        origin = source / relative
+        if not origin.is_file():
+            raise SystemExit(f"Missing upstream default-skin resource: {origin}")
+        target = root / "usr/local/share/enigma2" / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(origin, target)
+    for name in ("Roboto-Black.ttf", "Roboto-BlackItalic.ttf", "Roboto-Bold.ttf", "Roboto-BoldItalic.ttf"):
+        origin = source / "fonts" / name
+        if not origin.is_file():
+            raise SystemExit(f"Missing upstream default-skin font: {origin}")
+        target = root / "usr/local/share/fonts" / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(origin, target)
+
+    # These files once simulated hardware/procfs capabilities. Metadata and
+    # mode controls now come from the decoder/KMS backend, not canned values.
+    legacy = root / "var/stb"
+    for relative in (
+        "vmpeg/0/xres", "vmpeg/0/yres", "vmpeg/0/aspect", "vmpeg/0/framerate",
+        "vmpeg/0/fallback_framerate", "vmpeg/0/progressive", "vmpeg/0/dst_top",
+        "vmpeg/0/dst_left", "vmpeg/0/dst_width", "vmpeg/0/dst_height",
+        "vmpeg/0/dst_apply", "vmpeg/0/smooth", "video/alpha", "video/aspect",
+        "video/policy", "video/policy2", "video/policy_choices", "video/videomode",
+        "video/videomode_50hz", "video/videomode_24hz", "video/videomode_60hz",
+        "video/videomode_choices", "video/hdmi_colorspace", "video/hdmi_colorspace_choices",
+        "avs/0/input", "avs/0/input_choices", "avs/0/colorformat",
+    ):
+        (legacy / relative).unlink(missing_ok=True)
+    for node in (legacy / "vmpeg/0").glob("pep_*"):
+        if node.is_file() and not node.is_symlink():
+            node.unlink()
+
+
 def enigma2(root):
+    prepare_runtime(root)
     for firmware in ("lib/firmware/hisilicon", "usr/lib/firmware/hisilicon"):
         if (root / firmware).exists():
             raise SystemExit(f"Kernel-owned firmware must not be packaged: {firmware}")
-    for required in ("usr/local/bin/enigma2.bin", "usr/local/bin/enigma2", "usr/local/bin/socketdaemon", "DEBIAN/postinst"):
+    for required in ("usr/local/bin/enigma2.bin", "usr/local/bin/enigma2", "usr/local/bin/socketdaemon", "usr/local/bin/histb-screenshot", "DEBIAN/postinst"):
         if not (root / required).is_file():
             raise SystemExit(f"Missing Enigma2 runtime file: {required}")
     if not elf(root / "usr/local/bin/enigma2.bin"):
         raise SystemExit("enigma2.bin must contain the real ELF executable")
     # MetrixHD uses OE's absolute font paths; autotools installs the same
     # supplied fonts under this application's /usr/local prefix on Debian.
-    for name in ("lcd.ttf", "ae_AlMateen.ttf", "andale.ttf", "nmsbd.ttf", "DejaVuSans.ttf"):
+    for name in ("lcd.ttf", "ae_AlMateen.ttf", "andale.ttf", "nmsbd.ttf", "DejaVuSans.ttf",
+                 "Roboto-Black.ttf", "Roboto-BlackItalic.ttf", "Roboto-Bold.ttf", "Roboto-BoldItalic.ttf"):
         source = root / "usr/local/share/fonts" / name
         if not source.is_file():
             raise SystemExit(f"Missing skin font: {name}")
