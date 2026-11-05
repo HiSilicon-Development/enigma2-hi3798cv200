@@ -1,7 +1,176 @@
+diff --git a/plugin/controllers/ajax.py b/plugin/controllers/ajax.py
+index 2c8e6ab2..c6be2f12 100644
+--- a/plugin/controllers/ajax.py
++++ b/plugin/controllers/ajax.py
+@@ -121,8 +121,8 @@ class AjaxController(BaseController):
+ 
+ 	def P_boxinfo(self, request):
+ 		info = getInfo(self.session, need_fullinfo=True)
+-		boxtype = info["boxtype"]
+-		info["boximage"] = f"{boxtype}_front.png"
++		image = f"{info['boxtype']}_front.png"
++		info["boximage"] = image if exists(getPublicPath(f"hardware/{image}")) else "unknown.png"
+ 		return info
+ 
+ 	# http://enigma2/ajax/epgpop?sstr=test&bouquetsonly=1
+@@ -252,6 +252,7 @@ class AjaxController(BaseController):
+ 			"result": True
+ 		}
+ 		ret['configsections'] = getConfigsSections()['sections']
++		ret['package_manager_available'] = BoxInfo.getItem("OpkgAvailable", False)
+ 		if config.OpenWebif.webcache.theme.value:
+ 			if exists(getPublicPath('themes')):
+ 				ret['themes'] = config.OpenWebif.webcache.theme.choices
+diff --git a/plugin/controllers/base.py b/plugin/controllers/base.py
+index b1838140..686ecc90 100644
+--- a/plugin/controllers/base.py
++++ b/plugin/controllers/base.py
+@@ -37,7 +37,7 @@ from Components.SystemInfo import BoxInfo
+ 
+ from .models.info import getInfo
+ from .models.config import getCollapsedMenus, getConfigsSections, getShowName, getCustomName, getBoxName
+-from .defaults import getPublicPath, getViewsPath, EXT_EVENT_INFO_SOURCE, STB_LANG, getIP, TEXTINPUTSUPPORT, globalVars
++from .defaults import getPublicPath, getViewsPath, isMobileRequest, EXT_EVENT_INFO_SOURCE, STB_LANG, getIP, TEXTINPUTSUPPORT, globalVars
+ from .utilities import toBinary, toString
+ 
+ 
+@@ -99,22 +99,22 @@ class BaseController(resource.Resource):
+ 		request.write(b"<html><head><title>OpenWebif</title></head><body><h1>Error 404: Not found</h1><br>The requested page doesn't exist.</body></html>")
+ 		request.finish()
+ 
+-	def loadTemplate(self, path, module, args):
++	def loadTemplate(self, path, module, args, request=None):
+ 		template = None
+-		if exists(getViewsPath(f"{path}.pyc")):
+-			spec = spec_from_file_location(module, getViewsPath(f"{path}.pyc"))
++		if exists(getViewsPath(f"{path}.pyc", request)):
++			spec = spec_from_file_location(module, getViewsPath(f"{path}.pyc", request))
+ 			template = module_from_spec(spec)
+ 			spec.loader.exec_module(template)
+-		elif exists(getViewsPath(f"{path}.py")):
+-			spec = spec_from_file_location(module, getViewsPath(f"{path}.py"))
++		elif exists(getViewsPath(f"{path}.py", request)):
++			spec = spec_from_file_location(module, getViewsPath(f"{path}.py", request))
+ 			template = module_from_spec(spec)
+ 			spec.loader.exec_module(template)
+ 		if template:
+ 			mod = getattr(template, module, None)
+ 			if callable(mod):
+ 				return str(mod(searchList=args))
+-		if exists(getViewsPath(f"{path}.tmpl")):
+-			vp = str(getViewsPath(f"{path}.tmpl"))
++		if exists(getViewsPath(f"{path}.tmpl", request)):
++			vp = str(getViewsPath(f"{path}.tmpl", request))
+ 			return str(Template(file=vp, searchList=[args]))
+ 		return None
+ 
+@@ -191,6 +191,33 @@ class BaseController(resource.Resource):
+ 				plfunc(request)
+ 
+ 			data = func(request)
++			if isinstance(data, defer.Deferred):
++				# Configuration backends finish asynchronously; never serialize the
++				# Deferred itself or acknowledge a queued operation as completed.
++				module = toString(request.path).strip("/").replace(".", "")
++				page = self.path
++				isJson = self.isJson
++				def completed(result):
++					if isJson:
++						request.setHeader("content-type", "application/json; charset=utf-8")
++						out = json.dumps(result, indent=1)
++					else:
++						out = self.loadTemplate(module, page, result, request)
++						if out is None:
++							self.error404(request)
++							return
++					request.write(toBinary(out))
++					request.finish()
++				def failed(failure):
++					request.setResponseCode(http.INTERNAL_SERVER_ERROR)
++					return completed({"result": False, "message": failure.getErrorMessage()})
++				data.addCallback(completed)
++				data.addErrback(failed)
++				self.withMainTemplate = _withmaintemplate
++				self.path = _path
++				self.isCustom = _iscustom
++				self.isImage = _isimage
++				return server.NOT_DONE_YET
+ 			if data is None:
+ 				# if not self.suppresslog:
+ 					# print "[OpenWebif] page '%s' without content" % request.uri
+@@ -224,7 +251,7 @@ class BaseController(resource.Resource):
+ 					module += "/index"
+ 				module = module.strip("/")
+ 				module = module.replace(".", "")
+-				out = self.loadTemplate(module, self.path, data)
++				out = self.loadTemplate(module, self.path, data, request)
+ 				if out is None:
+ 					print(f"[OpenWebif] ERROR! Template not found for page '{request.uri}'")
+ 					self.error404(request)
+@@ -232,7 +259,7 @@ class BaseController(resource.Resource):
+ 					if self.withMainTemplate:
+ 						args = self.prepareMainTemplate(request)
+ 						args["content"] = out
+-						nout = self.loadTemplate("main", "main", args)
++						nout = self.loadTemplate("main", "main", args, request)
+ 						if nout:
+ 							out = nout
+ 					elif self.isGZ:
+@@ -288,6 +315,8 @@ class BaseController(resource.Resource):
+ 	def prepareMainTemplate(self, request):
+ 		# here will be generated the dictionary for the main template
+ 		ret = getCollapsedMenus()
++		ret['mobiledevice'] = isMobileRequest(request)
++		ret['assetversion'] = BoxInfo.getApplicationVersionString()
+ 		ret['configsections'] = getConfigsSections()['sections']
+ 		ret['showname'] = getShowName()['showname']
+ 		ret['customname'] = getCustomName()['customname']
+diff --git a/plugin/controllers/defaults.py b/plugin/controllers/defaults.py
+index b7f6511f..c7bc1759 100644
+--- a/plugin/controllers/defaults.py
++++ b/plugin/controllers/defaults.py
+@@ -45,8 +45,6 @@ sys.path.insert(0, PLUGIN_ROOT_PATH)
+ 
+ STB_LANG = language.getLanguage()
+ 
+-MOBILEDEVICE = False
+-
+ DEBUG_ENABLED = False
+ 
+ 
+@@ -78,14 +76,13 @@ def getExtEventInfoProvider():
+ 	return defaultvalue
+ 
+ 
+-def setMobile(ismobile=False):
+-# TODO: do we need this?
+-	global MOBILEDEVICE
+-	MOBILEDEVICE = ismobile
++def isMobileRequest(request):
++	uagent = (request.getHeader('User-Agent') or "").lower() if request is not None else ""
++	return any(device in uagent for device in ("iphone", "ipod", "blackberry", "mobile"))
+ 
+ 
+-def getViewsPath(file=""):
+-	if (comp_config.OpenWebif.webcache.responsive_enabled.value or MOBILEDEVICE) and exists(f"{VIEWS_PATH}/responsive") and not (file.startswith('web/') or file.startswith('/web/')):
++def getViewsPath(file="", request=None):
++	if (comp_config.OpenWebif.webcache.responsive_enabled.value or isMobileRequest(request)) and exists(f"{VIEWS_PATH}/responsive") and not (file.startswith('web/') or file.startswith('/web/')):
+ 		return f"{VIEWS_PATH}/responsive/{file}"
+ 	else:
+ 		return f"{VIEWS_PATH}/{file}"
 diff --git a/plugin/controllers/i18n.py b/plugin/controllers/i18n.py
-index 514113e7..30b0893c 100644
+index 514113e7..ff3c0205 100644
 --- a/plugin/controllers/i18n.py
 +++ b/plugin/controllers/i18n.py
+@@ -168,7 +168,7 @@ tstrings = {
+ 	'nothing': _("Nothing"),
+ 	'nothing_play': _("Nothing playing."),
+ 	'now': _("Now"),
+-	'oe_version': _("System OE"),
++	'operating_system': _("Operating system"),
+ 	'on': _("On"),
+ 	'openwebif_header': _("Open Source Web Interface for Linux set-top box"),
+ 	'show_boxname': _("Show box name in header"),
 @@ -199,6 +199,7 @@ tstrings = {
  	'satfinder': _("Satfinder"),
  	'save': _("Save"),
@@ -10,22 +179,143 @@ index 514113e7..30b0893c 100644
  	'search': _("Search"),
  	'search_csfd': _("Search CSFD"),
  	'search_imdb': _("Search IMDb"),
+diff --git a/plugin/controllers/ipkg.py b/plugin/controllers/ipkg.py
+index 1e504555..53f19bd6 100644
+--- a/plugin/controllers/ipkg.py
++++ b/plugin/controllers/ipkg.py
+@@ -22,6 +22,7 @@ from glob import glob
+ from json import dumps
+ from os import remove, stat as osstat
+ from enigma import eConsoleAppContainer
++from os.path import isfile
+ from twisted.web import server, resource, http
+ 
+ 
+@@ -37,6 +38,10 @@ class IpkgController(BaseController):
+ 		self.putChild(b'upload', IPKGUpload(self.session))
+ 
+ 	def render(self, request):
++		if not isfile("/usr/bin/opkg"):
++			request.setResponseCode(http.NOT_IMPLEMENTED)
++			request.setHeader("content-type", "application/json; charset=utf-8")
++			return dumps({"result": False, "message": "OPKG is not installed; this receiver uses its native package manager."}).encode("UTF-8")
+ 		self.request = request
+ 		self.json = False
+ 		self.container = None
 diff --git a/plugin/controllers/models/config.py b/plugin/controllers/models/config.py
-index 6ba7c445..610275f0 100644
+index 6ba7c445..827bb00a 100644
 --- a/plugin/controllers/models/config.py
 +++ b/plugin/controllers/models/config.py
-@@ -26,8 +26,8 @@ from time import time
+@@ -24,10 +24,11 @@ from os import listdir
+ from os.path import exists, dirname, basename, join
+ from time import time
  from xml.etree.ElementTree import parse
++from twisted.internet.defer import Deferred, inlineCallbacks
  
  from enigma import eEnv
 -from Components.SystemInfo import BoxInfo, SystemInfo
 -from Components.config import config, ConfigBoolean
 +from Components.SystemInfo import BoxInfo
-+from Components.config import config, configfile, ConfigBoolean
++from Components.config import config, configfile, ConfigBoolean, ConfigSelection, ConfigSequence, ConfigService, ConfigText
  
  try:
  	from Components.config import setupOnSave  # Get setupOnSave if available otherwise fallback to empty dict
-@@ -176,6 +176,19 @@ def getJsonFromConfig(cnf):
+@@ -50,12 +51,7 @@ def addCollapsedMenu(name):
+ 	if name not in tags:
+ 		tags.append(name)
+ 
+-	config.OpenWebif.webcache.collapsedmenus.value = "|".join(tags).strip("|")
+-	config.OpenWebif.webcache.collapsedmenus.save()
+-
+-	return {
+-		"result": True
+-	}
++	return saveConfig("config.OpenWebif.webcache.collapsedmenus", "|".join(tags).strip("|"), True)
+ 
+ 
+ def removeCollapsedMenu(name):
+@@ -63,12 +59,7 @@ def removeCollapsedMenu(name):
+ 	if name in tags:
+ 		tags.remove(name)
+ 
+-	config.OpenWebif.webcache.collapsedmenus.value = "|".join(tags).strip("|")
+-	config.OpenWebif.webcache.collapsedmenus.save()
+-
+-	return {
+-		"result": True
+-	}
++	return saveConfig("config.OpenWebif.webcache.collapsedmenus", "|".join(tags).strip("|"), True)
+ 
+ 
+ def getCollapsedMenus():
+@@ -100,23 +91,15 @@ def getBoxName():
+ 
+ 
+ def getJsonFromConfig(cnf):
+-	if cnf.__class__.__name__ in ("ConfigSelectionInteger", "ConfigSelectionNumber", "ConfigSelection"):
+-		if isinstance(cnf.choices.choices, dict):
+-			choices = []
+-			for choice in cnf.choices.choices:
+-				choices.append((choice, _(cnf.choices.choices[choice])))
+-		elif isinstance(cnf.choices.choices[0], tuple):
+-			choices = []
+-			for choice_tuple in cnf.choices.choices:
+-				name = choice_tuple[1]
+-				if name.startswith("<") and name.endswith(">"):
+-					name = TRANSLATE.get(choice_tuple[0], name)
+-					name = name.replace("<", "&lt;").replace(">", "&gt;")
+-				choices.append((choice_tuple[0], _(name)))
+-		else:
+-			choices = []
+-			for choice in cnf.choices.choices:
+-				choices.append((choice, _(choice)))
++	if isinstance(cnf, ConfigSelection):
++		choices = []
++		rawChoices = cnf.choices.choices
++		entries = rawChoices.items() if isinstance(rawChoices, dict) else (choice if isinstance(choice, tuple) else (choice, choice) for choice in rawChoices)
++		for choice, label in entries:
++			name = str(label)
++			if name.startswith("<") and name.endswith(">"):
++				name = TRANSLATE.get(choice, name).replace("<", "&lt;").replace(">", "&gt;")
++			choices.append((choice, _(name)))
+ 
+ 		return {
+ 			"result": True,
+@@ -152,12 +135,14 @@ def getJsonFromConfig(cnf):
+ 			"limits": (cnf.limits[0][0], cnf.limits[0][1])
+ 		}
+ 
+-	elif cnf.__class__.__name__ == "ConfigText":
++	elif isinstance(cnf, ConfigText) and not getattr(cnf, "censor", ""):
+ 		return {
+ 			"result": True,
+ 			"type": "text",
+ 			"current": cnf.value
+ 		}
++	elif isinstance(cnf, ConfigService):
++		return {"result": True, "type": "text", "current": cnf.toString(cnf.value)}
+ 	elif cnf.__class__.__name__ == "ConfigSlider":
+ 		return {
+ 			"result": True,
+@@ -166,16 +151,68 @@ def getJsonFromConfig(cnf):
+ 			"increment": cnf.increment,
+ 			"limits": (cnf.min, cnf.max)
+ 		}
++	elif isinstance(cnf, ConfigSequence) and not getattr(cnf, "censor", ""):
++		return {
++			"result": True,
++			"type": "text",
++			"current": cnf.toString(cnf.value)
++		}
+ 	elif cnf.__class__.__name__ == "ConfigNothing":
+ 		return None
+ 
+ 	print(f"[OpenWebif] Unknown class '{cnf.__class__.__name__}'")
+ 	return {
+ 		"result": False,
+-		"type": "unknown"
++		"type": "unknown",
++		"message": _("This setting requires the receiver's on-screen setup.")
  	}
  
  
@@ -42,19 +332,147 @@ index 6ba7c445..610275f0 100644
 +		raise
 +
 +
++def _applyTimeSettings():
++	from Components.NetworkTime import ntpSyncPoller
++	if not ntpSyncPoller.isDebian:
++		ntpSyncPoller.timeCheck()
++		return None
++	completed = Deferred()
++	def applied(error):
++		if error:
++			completed.errback(RuntimeError(error))
++		else:
++			completed.callback(True)
++	ntpSyncPoller.applySettings(ntpSyncPoller.getSettings(), applied)
++	return completed
++
++
++def _applyCamSettings(name):
++	from Screens.SoftcamSetup import CamControl
++	control = CamControl(name)
++	selected = getattr(config.misc, f"{name}s").value
++	if selected == control.current() and not control.systemdUnit:
++		return None
++	completed = Deferred()
++	def applied(exitCode):
++		if exitCode:
++			completed.errback(RuntimeError(_("Unable to apply %s settings (exit code %s).") % (control.name, exitCode)))
++		else:
++			completed.callback(True)
++	control.switch(selected, applied)
++	return completed
++
++
++@inlineCallbacks
  def saveConfig(path, value, save):
  	oldValue = None
  	try:
-@@ -221,7 +234,7 @@ def saveConfig(path, value, save):
+@@ -189,14 +226,19 @@ def saveConfig(path, value, save):
+ 		}
+ 
+ 	try:
+-		if cnf.__class__.__name__ in ("ConfigBoolean", "ConfigEnableDisable", "ConfigYesNo"):
++		if isinstance(cnf, ConfigSelection):
++			if str(value) not in map(str, cnf.choices):
++				raise ValueError("Invalid selection")
++			cnf.value = value
++		elif isinstance(cnf, ConfigBoolean):
+ 			cnf.value = value == "true"
+ 		elif cnf.__class__.__name__ == "ConfigSet":
+-			values = cnf.value
+-			if int(value) in values:
+-				values.remove(int(value))
++			values = list(cnf.value)
++			choice = next(choice for choice in cnf.choices.choices if str(choice) == value)
++			if choice in values:
++				values.remove(choice)
+ 			else:
+-				values.append(int(value))
++				values.append(choice)
+ 			cnf.value = values
+ 		elif cnf.__class__.__name__ == "ConfigNumber":
+ 			cnf.value = int(value)
+@@ -218,15 +260,25 @@ def saveConfig(path, value, save):
+ 			elif cnf_value > cnf_max:
+ 				cnf_value = cnf_max
+ 			cnf.value = cnf_value
++		elif isinstance(cnf, ConfigSequence):
++			parsed = cnf.fromString(value)
++			if len(parsed) != len(cnf.limits) or any(not low <= part <= high for part, (low, high) in zip(parsed, cnf.limits)):
++				raise ValueError("Invalid setting value")
++			cnf.value = parsed
  		else:
  			cnf.value = value
  		if save:
 -			cnf.save()
++			if path in ("config.misc.SyncTimeUsing", "config.misc.NTPserver", "config.misc.useNTPminutes"):
++				yield _applyTimeSettings()
++			elif path in ("config.misc.softcams", "config.misc.cardservers"):
++				yield _applyCamSettings("softcam" if path.endswith("softcams") else "cardserver")
 +			_persistConfig([cnf])
  		configfiles.reload()
  	except Exception as e:
  		print(f"[OpenWebif] saveConfig Error : {e}")
-@@ -283,6 +296,7 @@ def saveConfigBatch(keys, section):
+ 		return {
+-			"result": False
++			"result": False,
++			"message": str(e)
+ 		}
+ 
+ 	return {
+@@ -237,6 +289,7 @@ def saveConfig(path, value, save):
+ 	}
+ 
+ 
++@inlineCallbacks
+ def cancelConfigBatch(keys, section):
+ 	if not keys or not isinstance(keys, list):
+ 		return {
+@@ -254,27 +307,34 @@ def cancelConfigBatch(keys, section):
+ 			print(f"[OpenWebif] cancelConfigBatch Error for {path}: {exc}")
+ 			errors.append(f"Config '{path}' not found")
+ 			continue
+-
+-		print(f"[OpenWebif] cancelConfigBatch canceling {path}")
+-		print(f"[OpenWebif] cancelConfigBatch current value of {path} is {cnf.value}")
+-
+ 		try:
+ 			cnf.cancel()
+ 			successful += 1
+ 		except Exception as e:
+ 			print(f"[OpenWebif] cancelConfigBatch Error for {path}: {e}")
+ 			errors.append(f"Error canceling '{path}': {str(e)}")
+-
+-		print(f"[OpenWebif] cancelConfigBatch new value of {path} is {cnf.value}")
+-
++	if section in ("Time", "time"):
++		try:
++			yield _applyTimeSettings()
++		except Exception as error:
++			errors.append(str(error))
++	if section in ("Softcam", "Cardserver"):
++		try:
++			from Screens.SoftcamSetup import CamControl
++			name = section.lower()
++			if getattr(config.misc, f"{name}s").value != CamControl(name).current():
++				yield _applyCamSettings(name)
++		except Exception as error:
++			errors.append(str(error))
+ 	try:
+ 		configfiles.reloadSection(section)
+ 	except Exception as e:
+ 		print(f"[OpenWebif] cancelConfigBatch reload error: {e}")
+-		return {"result": False, "message": str(e)}
+-	return {"result": True}
++		errors.append("Error reloading configuration")
++	return {"result": successful == len(keys) and not errors, "successful": successful, "total": len(keys), "errors": errors}
+ 
+ 
++@inlineCallbacks
+ def saveConfigBatch(keys, section):
+ 	if not keys or not isinstance(keys, list):
+ 		return {
+@@ -283,6 +343,7 @@ def saveConfigBatch(keys, section):
  		}
  
  	errors = []
@@ -62,38 +480,45 @@ index 6ba7c445..610275f0 100644
  	successful = 0
  
  	for path in keys:
-@@ -293,30 +307,39 @@ def saveConfigBatch(keys, section):
+@@ -293,12 +354,22 @@ def saveConfigBatch(keys, section):
  			errors.append(f"Config '{path}' not found")
  			continue
  
 +		elements.append(cnf)
 +
-+	if elements:
++	applied = None
++	if elements and not errors:
  		try:
 -			cnf.save()
 -			successful += 1
 -		except Exception as e:
 -			print(f"[OpenWebif] saveConfigBatch Error for {path}: {e}")
 -			errors.append(f"Error saving '{path}': {str(e)}")
++			if section in ("Time", "time") or any(path in ("config.misc.SyncTimeUsing", "config.misc.NTPserver", "config.misc.useNTPminutes") for path in keys):
++				applied = False
++				applied = yield _applyTimeSettings()
++			elif section in ("Softcam", "Cardserver"):
++				applied = False
++				applied = yield _applyCamSettings(section.lower())
 +			_persistConfig(elements)
 +			successful = len(elements)
 +		except Exception as error:
-+			print(f"[OpenWebif] saveConfigBatch persistence error: {error}")
-+			errors.append(f"Error saving configuration: {error}")
++			print(f"[OpenWebif] saveConfigBatch application/persistence error: {error}")
++			errors.append(str(error))
  
  	try:
  		configfiles.reloadSection(section)
- 	except Exception as e:
+@@ -306,17 +377,22 @@ def saveConfigBatch(keys, section):
  		print(f"[OpenWebif] saveConfigBatch reload error: {e}")
  		errors.append("Error reloading configuration")
-+	applied = None
  
 -	if section in setupOnSave:
 +	if successful and section in setupOnSave:
  		try:
  			callback = setupOnSave.get(section)
  			if callback and callable(callback):
- 				callback()
+-				callback()
++				yield callback()
 +				applied = True
  		except Exception as e:
  			print(f"[OpenWebif] saveConfigBatch callback error for section '{section}': {e}")
@@ -108,7 +533,62 @@ index 6ba7c445..610275f0 100644
  		"total": len(keys),
  		"errors": errors if errors else []
  	}
-@@ -498,7 +521,7 @@ class ConfigFiles:
+@@ -329,6 +405,23 @@ def getConfigs(key):
+ 	pluginLanguageDomain = None
+ 	if len(configfiles.sections) == 0:
+ 		configfiles.parseConfigFiles()
++	if key == "MovieSelection":
++		from Screens.MovieSelection import MovieSelection
++		MovieSelection.initUserDefinedActions()
++		configfiles.reloadSection(key)
++	elif key == "PluginBrowser":
++		# This screen module owns the plugin layout/filter ConfigElements.
++		from Screens import PluginBrowser  # noqa F401
++		configfiles.reloadSection(key)
++	elif key == "LCNScanner":
++		from Plugins.SystemPlugins.LCNScanner.plugin import LCNScanner
++		if not hasattr(config.plugins.LCNScanner, "rules"):
++			LCNScanner()
++		configfiles.reloadSection(key)
++	elif key in ("Softcam", "Cardserver") and key in configfiles.section_config:
++		from Screens.SoftcamSetup import initCamConfig
++		initCamConfig(key.lower())
++		configfiles.reloadSection(key)
+ 	if key in configfiles.section_config:
+ 		config_entries = configfiles.section_config[key][1]
+ 		title = configfiles.section_config[key][0]
+@@ -356,12 +449,17 @@ def getConfigs(key):
+ 					"data": data
+ 				})
+ 			except Exception:
+-				pass
++				configs.append({
++					"description": _(entry.get("text", "")),
++					"path": entry.text or "",
++					"data": {"result": False, "type": "unknown", "message": _("The setting's backend is unavailable. Use the receiver's on-screen setup.")}
++				})
+ 	return {
+-		"result": True,
++		"result": key in configfiles.section_config,
+ 		"configs": configs,
+ 		"title": title,
+-		"key": key
++		"key": key,
++		"message": "" if key in configfiles.section_config else _("This setup is not available at the current setup level or requires the receiver's on-screen setup.")
+ 	}
+ 
+ 
+@@ -446,8 +544,7 @@ class ConfigFiles:
+ 			for section in setupdom.getroot().findall("setup"):
+ 				if section.get("key") != key:
+ 					continue
+-				requires = section.get("requires")
+-				if requires and not BoxInfo.getItem(requires, False):
++				if not self.includeElement(section):
+ 					break
+ 				self.itemstoadd = []
+ 				self.addItems(section)
+@@ -498,7 +595,7 @@ class ConfigFiles:
  					except Exception:
  						return False
  				else:
@@ -117,6 +597,25 @@ index 6ba7c445..610275f0 100644
  				if require and negate == result:  # The item requirements are not met.
  					return False
  		conditional = element.get("conditional")
+@@ -518,7 +615,7 @@ class ConfigFiles:
+ 				break  # End of succesful if/elif branch - short-circuit rest of children.
+ 			include = self.includeElement(element)
+ 			if element.tag == "item":
+-				if including and include:
++				if including and include and element.text:
+ 					self.itemstoadd.append(element)
+ 			elif element.tag == "if":
+ 				if including:
+@@ -539,8 +636,7 @@ class ConfigFiles:
+ 
+ 			for section in xmldata.findall("setup"):
+ 				configs = []
+-				requires = section.get("requires")
+-				if requires and not BoxInfo.getItem(requires, False):
++				if not self.includeElement(section):
+ 					continue
+ 				key = section.get("key")
+ 				if key not in self.allowedsections:
 diff --git a/plugin/controllers/models/control.py b/plugin/controllers/models/control.py
 index a9bbfb88..d13382b4 100644
 --- a/plugin/controllers/models/control.py
@@ -417,6 +916,125 @@ index 4e0aea91..4f2a0ef5 100644
 +		# Keep ownership until completion or client disconnect, not just render().
 +		GrabRequest(request, self.session, self)
  		return server.NOT_DONE_YET
+diff --git a/plugin/controllers/models/info.py b/plugin/controllers/models/info.py
+index 01923eda..bda81aa7 100644
+--- a/plugin/controllers/models/info.py
++++ b/plugin/controllers/models/info.py
+@@ -25,12 +25,12 @@ from twisted import version
+ from twisted.internet.threads import deferToThread
+ from socket import has_ipv6, socket, AF_INET6, AF_INET, SOCK_DGRAM, inet_ntop, inet_pton, getaddrinfo
+ 
+-from enigma import eDVBVolumecontrol, eServiceCenter, eServiceReference, getEnigmaVersionString
++from enigma import eDVBVolumecontrol, eServiceCenter, eServiceReference
+ from Components.config import config
+ from Components.Harddisk import harddiskmanager
+ from Components.NimManager import nimmanager
+ from Components.Network import iNetwork
+-from Components.SystemInfo import BoxInfo
++from Components.SystemInfo import BoxInfo, getChipsetString
+ import NavigationInstance
+ from RecordTimer import parseEvent, RecordTimerEntry
+ from ServiceReference import ServiceReference
+@@ -119,6 +119,11 @@ def getLinkSpeed(iface):
+ 				speed = popen(f'iwlist {iface} bitrate | grep "Bit Rate"').read().split(":")[1].split(" ")[0]
+ 			except:  # nosec # noqa: E722
+ 				pass
++	try:
++		if float(speed) <= 0:
++			return _("unknown")
++	except ValueError:
++		return _("unknown")
+ 	speed = str(speed) + " MBit/s"
+ 	speed = speed.replace("10000 MBit/s", "10 GBit/s")
+ 	speed = speed.replace("1000 MBit/s", "1 GBit/s")
+@@ -128,7 +133,8 @@ def getLinkSpeed(iface):
+ def getNICChipSet(iface):
+ 	nic = _("unknown")
+ 	try:
+-		nic = str(realpath(f"/sys/class/net/{iface}/device/driver").split("/")[-1])
++		if exists(f"/sys/class/net/{iface}/device/driver"):
++			nic = realpath(f"/sys/class/net/{iface}/device/driver").split("/")[-1]
+ 	except:  # nosec # noqa: E722
+ 		pass
+ 	return nic
+@@ -299,7 +305,7 @@ def getInfo(session=None, need_fullinfo=False):
+ 		return STATICBOXINFO
+ 
+ 	info["brand"] = BoxInfo.getItem("displaybrand")
+-	info["model"] = BoxInfo.getItem("displaymodel")
++	info["model"] = BoxInfo.getDeviceModelString()
+ 	info["boxtype"] = BoxInfo.getItem("machinebuild")
+ 	info["machinebuild"] = BoxInfo.getItem("model")
+ 
+@@ -310,7 +316,7 @@ def getInfo(session=None, need_fullinfo=False):
+ 
+ 	INFOMODEL = "/proc/stb/info/model"
+ 
+-	chipset = "unknown"
++	chipset = getChipsetString()
+ 	if exists("/etc/.box"):
+ 		f = open("/etc/.box")
+ 		model = f.readline().strip().lower()
+@@ -413,14 +419,14 @@ def getInfo(session=None, need_fullinfo=False):
+ 	info["webifver"] = OPENWEBIFVER
+ 	info["imagedistro"] = BoxInfo.getItem("distro")
+ 	info["friendlyimagedistro"] = BoxInfo.getItem("displaydistro")
+-	info["oever"] = BoxInfo.getItem("oe")
++	info["oever"] = BoxInfo.getOSVersionString()
+ 	info["imagever"] = BoxInfo.getItem("imageversion")
+ 	ib = BoxInfo.getItem("imagebuild")
+ 	if ib:
+ 		info["imagever"] = f"{info['imagever']}.{ib}"
+-	info["enigmaver"] = getEnigmaVersionString()
+-	info["driverdate"] = BoxInfo.getItem("driversdate")
+-	info["kernelver"] = BoxInfo.getItem("kernel")
++	info["enigmaver"] = BoxInfo.getApplicationVersionString()
++	info["driverdate"] = BoxInfo.getItem("driversdate") or BoxInfo.getDriverInstalledDate()
++	info["kernelver"] = BoxInfo.getKernelVersionString()
+ 
+ 	try:
+ 		from Tools.StbHardware import getFPVersion
+@@ -473,19 +479,22 @@ def getInfo(session=None, need_fullinfo=False):
+ 		})
+ 
+ 	info["hdd"] = []
+-	for hdd in harddiskmanager.hdd:
++	for diskEntry in harddiskmanager.HDDList():
++		hdd = diskEntry[1]
+ 		dev = hdd.findMount()
++		free = None
+ 		if dev:
+-			stat = statvfs(dev)
+-			free = stat.f_bavail * stat.f_frsize / 1048576.
+-		else:
+-			free = -1
+-
+-		if free <= 1024:
++			try:
++				stat = statvfs(dev)
++				free = stat.f_bavail * stat.f_frsize / 1048576.
++			except OSError:
++				pass
++		if free is None:
++			free = _("Unknown") if dev else _("Not mounted")
++		elif free <= 1024:
+ 			free = "%i %s" % (free, _("MB"))
+ 		else:
+-			free = free / 1024.
+-			free = f"{free:.1f} {_('GB')}"
++			free = f"{free / 1024.:.1f} {_('GB')}"
+ 
+ 		size = hdd.diskSize() * 1000000 / 1048576.
+ 		if size > 1048576:
+@@ -518,7 +527,7 @@ def getInfo(session=None, need_fullinfo=False):
+ 			"capacity": size,
+ 			"labelled_capacity": iecsize,
+ 			"free": free,
+-			"mount": dev,
++			"mount": dev or _("Not mounted"),
+ 			"friendlycapacity": _("%s free / %s total") % (free, f"{size} ({iecsize})")
+ 		})
+ 
 diff --git a/plugin/controllers/models/services.py b/plugin/controllers/models/services.py
 index 2a96be42..dbce6c6c 100644
 --- a/plugin/controllers/models/services.py
@@ -451,6 +1069,108 @@ index 2a96be42..dbce6c6c 100644
  			"apid": getServiceInfoString(info, iServiceInformation.sAudioPID),
  			"vpid": getServiceInfoString(info, iServiceInformation.sVideoPID),
  			"pcrpid": getServiceInfoString(info, iServiceInformation.sPCRPID),
+diff --git a/plugin/controllers/root.py b/plugin/controllers/root.py
+index 09184ad8..beccec93 100644
+--- a/plugin/controllers/root.py
++++ b/plugin/controllers/root.py
+@@ -22,7 +22,6 @@
+ from os.path import exists
+ 
+ from twisted.web import static, proxy
+-from Components.config import config
+ from Components.Harddisk import harddiskmanager
+ 
+ from .models.grab import GrabScreenshot
+@@ -37,7 +36,7 @@ from .wol import WOLSetupController, WOLClientController
+ from .file import FileController
+ from .MultiBoot import MultiBootController
+ from .Scripts import ScriptsController
+-from .defaults import getPublicPath, VIEWS_PATH, setMobile, globalVars
++from .defaults import getPublicPath, globalVars
+ from .utilities import toBinary
+ 
+ 
+@@ -106,11 +105,4 @@ class RootController(BaseController):
+ 	# the "pages functions" must be called P_pagename
+ 	# example http://boxip/index => P_index
+ 	def P_index(self, request):
+-		if not config.OpenWebif.webcache.responsive_enabled.value:
+-			setMobile()
+-			if exists(f"{VIEWS_PATH}/responsive"):
+-				uagent = request.getHeader('User-Agent') or ""
+-				uagent = uagent.lower()
+-				if uagent.find("iphone") != -1 or uagent.find("ipod") != -1 or uagent.find("blackberry") != -1 or uagent.find("mobile") != -1:
+-					setMobile(True)
+ 		return {}
+diff --git a/plugin/controllers/views/ajax/boxinfo.tmpl b/plugin/controllers/views/ajax/boxinfo.tmpl
+index 773aa535..8c2f9b10 100644
+--- a/plugin/controllers/views/ajax/boxinfo.tmpl
++++ b/plugin/controllers/views/ajax/boxinfo.tmpl
+@@ -4,7 +4,11 @@
+ 	<div id="info">
+ 		<h3 class="ui-widget-header">$tstrings['box_info']</h3>
+ 		<hr />
++		#if $boximage != 'unknown.png'
+ 		<img src="hardware/${boximage}" id="box_image" alt="box_info">
++		#else
++		<div class="ui-widget-header">$tstrings['box']</div>
++		#end if
+ 		<hr />
+ 		<br/>
+ 		<table width="100%">
+@@ -40,7 +44,7 @@
+ 							<th colspan="2" class="ui-widget-header">$tstrings['software']</th>
+ 						</tr>
+ 						<tr>
+-							<td class="infoleft">$tstrings['oe_version']:</td>
++							<td class="infoleft">$tstrings['operating_system']:</td>
+ 							<td class="inforight">$oever</td>
+ 						</tr>
+ 						<tr>
+diff --git a/plugin/controllers/views/ajax/config.tmpl b/plugin/controllers/views/ajax/config.tmpl
+index 7abad7f0..e0a88de5 100644
+--- a/plugin/controllers/views/ajax/config.tmpl
++++ b/plugin/controllers/views/ajax/config.tmpl
+@@ -35,9 +35,9 @@
+ <td>
+ 	#for $choice in $config.data.choices
+ 		#if $choice in $config.data.current
+-			<input type="checkbox" id="${config.path}_${choice}" data-config-type="multicheckbox" data-config-group="$config.path" checked="true" onclick="updateConfig('$config.path', $choice, '$key');" />
++			<input type="checkbox" id="${config.path}_${choice}" value="$choice" data-config-type="multicheckbox" data-config-group="$config.path" checked="true" onclick="updateConfig('$config.path', this.value, '$key');" />
+ 		#else
+-			<input type="checkbox" id="${config.path}_${choice}" data-config-type="multicheckbox" data-config-group="$config.path" onclick="updateConfig('$config.path', $choice, '$key');" />
++			<input type="checkbox" id="${config.path}_${choice}" value="$choice" data-config-type="multicheckbox" data-config-group="$config.path" onclick="updateConfig('$config.path', this.value, '$key');" />
+ 		#end if
+ 		$choice
+ 	#end for
+@@ -65,6 +65,9 @@
+ 
+ <div id="content_main">
+ 	<h3 class="ui-widget-header">$title</h3>
++	#if not $result
++		<p>$message</p>
++	#end if
+ 	<table id="configuration">
+ 		#for $config in $configs:
+ 			#if $config.data.type == "select"
+@@ -79,13 +82,17 @@
+ 				$text($config)
+ 			#elif $config.data.type == "slider"
+ 				$number($config)
++			#else
++				<tr><td>$config.description</td><td>$config.data.message</td></tr>
+ 			#end if
+ 		#end for
+ 	</table>
++	#if $configs
+ 	<div style="margin-top: 15px; padding: 10px; text-align: right;">
+ 		<button id="btn_cancel" class="ui-button ui-widget ui-corner-all" style="margin-right: 10px;">$tstrings['cancel']</button>
+ 		<button id="btn_save" class="ui-button ui-widget ui-corner-all ui-button-primary">$tstrings['save']</button>
+ 	</div>
++	#end if
+ </div>
+ 
+ <script type="text/javascript">
 diff --git a/plugin/controllers/views/ajax/screenshot.tmpl b/plugin/controllers/views/ajax/screenshot.tmpl
 index abfadf6e..03f787ce 100644
 --- a/plugin/controllers/views/ajax/screenshot.tmpl
@@ -465,6 +1185,167 @@ index abfadf6e..03f787ce 100644
  				<div id="screenshotspinnerl" style="top: 50%;left: 50%;margin-left: 50px;margin-top: 50px;;position:absolute;font-size:50px">
  					<div id="screenshotspinner" class='fa fa-spin' style="display: none;"></div>
  				</div>
+diff --git a/plugin/controllers/views/ajax/settings.tmpl b/plugin/controllers/views/ajax/settings.tmpl
+index 69a7b1e4..a7ecb24b 100644
+--- a/plugin/controllers/views/ajax/settings.tmpl
++++ b/plugin/controllers/views/ajax/settings.tmpl
+@@ -187,6 +187,9 @@
+ 		<div id='packages' style="display:none;">
+ 			<div id="content_main2">
+ 				<h3 class="ui-widget-header">$tstrings['packages']</h3>
++				#if not $package_manager_available
++				<p>OPKG is not installed on this receiver. Debian packages are managed with APT, not this OPKG interface.</p>
++				#else
+ 				<div>
+ 					<span id="tb2">
+ 					<input class="pkgbtn" type="radio" id="pkgbtn1" name="tb2" checked="checked" /><label for="pkgbtn1">$tstrings['update']</label>
+@@ -222,6 +225,7 @@
+ 				<div id="tblpackages">
+ 					<ul id="packagelist"><div id='spinner'><div class='fa fa-spinner fa-spin'></div></div></ul>
+ 				</div>
++				#end if
+ 			</div>
+ 		</div>
+ 		<div id='bookmarks' style="display:none;">
+diff --git a/plugin/controllers/views/main.tmpl b/plugin/controllers/views/main.tmpl
+index a633f248..2f34037f 100644
+--- a/plugin/controllers/views/main.tmpl
++++ b/plugin/controllers/views/main.tmpl
+@@ -359,7 +359,7 @@
+ 
+ 	<script type="text/javascript" src="js/jquery-2.2.4.min.js"></script>
+ 	<script type="text/javascript" src="js/jquery-ui-1.13.2.min.js"></script>
+-	<script type="text/javascript" src="js/openwebif.min.js?v$__version__"></script>
++	<script type="text/javascript" src="js/openwebif.min.js?v=$assetversion"></script>
+ 	<script type="text/javascript" src="js/jquery-ui-timepicker-addon.min.js"></script>
+ 	<script type="text/javascript" src="/js/chosen-1.8.7.jquery.min.js"></script>
+ 	<script type="text/javascript">initJsTranslation($dumps($tstrings))</script>
+diff --git a/plugin/controllers/views/responsive/ajax/boxinfo.tmpl b/plugin/controllers/views/responsive/ajax/boxinfo.tmpl
+index 8efa3fc6..7d002508 100644
+--- a/plugin/controllers/views/responsive/ajax/boxinfo.tmpl
++++ b/plugin/controllers/views/responsive/ajax/boxinfo.tmpl
+@@ -44,7 +44,7 @@
+ 							</div>
+ 							<div class="row clearfix">
+ 								<div class="col-xs-12 col-sm-6">
+-									<b>$tstrings['internal_flash_memory']:</b>
++									<b>$tstrings['main_memory']:</b>
+ 								</div>
+ 								<div class="col-xs-12 col-sm-6">
+ 									$mem3
+@@ -71,7 +71,7 @@
+ 						<div class="body">
+ 							<div class="row clearfix">
+ 								<div class="col-xs-12 col-sm-6">
+-									<b>$tstrings['oe_version']:</b>
++									<b>$tstrings['operating_system']:</b>
+ 								</div>
+ 								<div class="col-xs-12 col-sm-6">
+ 									$oever
+diff --git a/plugin/controllers/views/responsive/ajax/config.tmpl b/plugin/controllers/views/responsive/ajax/config.tmpl
+index da4024b6..ceb154fb 100644
+--- a/plugin/controllers/views/responsive/ajax/config.tmpl
++++ b/plugin/controllers/views/responsive/ajax/config.tmpl
+@@ -2,10 +2,10 @@
+ 
+ #def select($config)
+ <div class="row clearfix">
+-	<div class="col-xs-5 align-right" style="padding-top:8px">
++	<div class="col-xs-12 col-sm-5 align-right" style="padding-top:8px">
+ 		<label>$config.description</label>
+ 	</div>
+-	<div class="col-xs-5">
++	<div class="col-xs-12 col-sm-7">
+ 		<select class="form-control show-tick" id="$config.path" data-config-type="select" onchange="updateConfig('$config.path', this.value, '$key');">
+ 			#for $choice in $config.data.choices
+ 				#if str($config.data.current) == str($choice[0])
+@@ -21,10 +21,10 @@
+ 
+ #def checkbox($config)
+ <div class="row clearfix">
+-	<div class="col-xs-5 align-right" style="padding-top:8px">
++	<div class="col-xs-12 col-sm-5 align-right" style="padding-top:8px">
+ 		<label>$config.description</label>
+ 	</div>
+-	<div class="col-xs-5">
++	<div class="col-xs-12 col-sm-7">
+ 		<div class="switch switch-col-indigo">
+ 		#if $config.data.current
+ 			<label>
+@@ -45,15 +45,15 @@
+ 
+ #def multicheckbox($config)
+ <div class="row clearfix">
+-	<div class="col-xs-5 align-right" style="padding-top:8px">
++	<div class="col-xs-12 col-sm-5 align-right" style="padding-top:8px">
+ 		<label>$config.description</label>
+ 	</div>
+-	<div class="col-xs-5">
++	<div class="col-xs-12 col-sm-7">
+ 	#for $choice in $config.data.choices
+ 		#if $choice in $config.data.current
+-			<input type="checkbox" id="${config.path}_${choice}" data-config-type="multicheckbox" data-config-group="$config.path" class="form-control chk--skinned" checked="checked" onclick="updateConfig('$config.path', $choice, '$key');">
++			<input type="checkbox" id="${config.path}_${choice}" value="$choice" data-config-type="multicheckbox" data-config-group="$config.path" class="form-control chk--skinned" checked="checked" onclick="updateConfig('$config.path', this.value, '$key');">
+ 		#else
+-			<input type="checkbox" id="${config.path}_${choice}" data-config-type="multicheckbox" data-config-group="$config.path" class="form-control chk--skinned" onclick="updateConfig('$config.path', $choice, '$key');">
++			<input type="checkbox" id="${config.path}_${choice}" value="$choice" data-config-type="multicheckbox" data-config-group="$config.path" class="form-control chk--skinned" onclick="updateConfig('$config.path', this.value, '$key');">
+ 		#end if
+ 			<label for="${config.path}_${choice}">$choice</label>
+ 	#end for
+@@ -63,10 +63,10 @@
+ 
+ #def number($config)
+ <div class="row clearfix">
+-	<div class="col-xs-5 align-right" style="padding-top:8px">
++	<div class="col-xs-12 col-sm-5 align-right" style="padding-top:8px">
+ 		<label>$config.description</label>
+ 	</div>
+-	<div class="col-xs-5">
++	<div class="col-xs-12 col-sm-7">
+ 		<div class="form-line">
+ 			<input type="number" name="${config.path}" id="${config.path}" data-config-type="number" value="$config.data.current" placeholder="$config.data.current" class="form-control" onkeydown="numberTextboxKeydownFilter(event);" onchange="updateConfig('$config.path', this.value, '$key');">
+ 		</div>
+@@ -76,10 +76,10 @@
+ 
+ #def text($config)
+ <div class="row clearfix">
+-	<div class="col-xs-5 align-right" style="padding-top:8px">
++	<div class="col-xs-12 col-sm-5 align-right" style="padding-top:8px">
+ 		<label>$config.description</label>
+ 	</div>
+-	<div class="col-xs-5">
++	<div class="col-xs-12 col-sm-7">
+ 		<div class="form-line">
+ 			<input type="text" name="${config.path}" id="${config.path}" data-config-type="text" value="$config.data.current" class="form-control" onchange="updateConfig('$config.path', this.value, '$key');">
+ 		</div>
+@@ -92,6 +92,9 @@
+ 		<i class='material-icons material-icons-centered'>settings</i>
+ 		$tstrings['settings'] - $title
+ 	</div>
++	#if not $result
++		<p>$message</p>
++	#end if
+ 	<div class="form-group" id="configuration">
+ 		#for $config in $configs:
+ 			#if $config.data.type == "select"
+@@ -106,13 +109,17 @@
+ 				$text($config)
+ 			#elif $config.data.type == "slider"
+ 				$number($config)
++			#else
++				<div class="row clearfix"><div class="col-xs-12 col-sm-5">$config.description</div><div class="col-xs-12 col-sm-7">$config.data.message</div></div>
+ 			#end if
+ 		#end for
+ 	</div>
++	#if $configs
+ 	<div style="margin-top: 15px; padding: 10px; text-align: right;">
+ 		<button id="btn_cancel" class="btn btn-default" style="margin-right: 10px;">$tstrings['cancel']</button>
+ 		<button id="btn_save" class="btn btn-primary">$tstrings['save']</button>
+ 	</div>
++	#end if
+ </div>
+ 
+ <script>
 diff --git a/plugin/controllers/views/responsive/ajax/screenshot.tmpl b/plugin/controllers/views/responsive/ajax/screenshot.tmpl
 index 2d53673a..edcd8109 100644
 --- a/plugin/controllers/views/responsive/ajax/screenshot.tmpl
@@ -479,3 +1360,586 @@ index 2d53673a..edcd8109 100644
  			</div>
  			<div class="row clearfix m-t-20">
  				<div class="col-xs-12 col-sm-7 align-right">
+diff --git a/plugin/controllers/views/responsive/ajax/settings.tmpl b/plugin/controllers/views/responsive/ajax/settings.tmpl
+index 8f2dd93d..2b427e68 100644
+--- a/plugin/controllers/views/responsive/ajax/settings.tmpl
++++ b/plugin/controllers/views/responsive/ajax/settings.tmpl
+@@ -120,6 +120,9 @@
+ 					<div style="display:none" id="thistitlepackages"><i class='material-icons material-icons-centered'>settings</i>$tstrings['settings'] - $tstrings['packages']</div>
+ 					<div id='packages' style="display:none;">
+ 						<div id="content_main2">
++						#if not $package_manager_available
++						<p>OPKG is not installed on this receiver. Debian packages are managed with APT, not this OPKG interface.</p>
++						#else
+ 							<div class="row clearfix">
+ 								<div class="col-xs-12">
+ 									<ul class="nav nav-tabs tab--skinned">
+@@ -214,6 +217,7 @@
+ 									</div>
+ 								</div>
+ 							</div>
++						#end if
+ 						</div>
+ 					</div>
+ 				</div>
+@@ -480,19 +484,16 @@
+ 			{
+ 				jQuery("#configtitle").html(jQuery('#thistitlebookmarks').html());
+ 				jQuery("#bookmarks").show();
+-			} else {
++			} else if (valueSelected) {
+ 				jQuery("#scontent").show();
+-				jQuery("#scontent").load('ajax/config?section=' + valueSelected, function () {
+-					jQuery("#scontent").find("#content_main").attr("id","content_main1");
+-				});
++				reloadConfigSection(valueSelected);
+ 			}
+ 		});
+ 
+-		jQuery('#settingselection').val('usage');
+-
+-		jQuery("#scontent").load('ajax/config?section=usage', function () {
+-			jQuery("#scontent").find("#content_main").attr("id","content_main1");
+-		});
++		var initialSection = jQuery('#settingselection option[value="Usage"]').length ? 'Usage' : jQuery('#settingselection option').eq(3).val();
++		if (initialSection) {
++			jQuery('#settingselection').val(initialSection).trigger('change');
++		}
+ 
+ 		jQuery('#tb2').buttonset();
+ 		jQuery('#tb3').buttonset();
+diff --git a/plugin/controllers/views/responsive/main.tmpl b/plugin/controllers/views/responsive/main.tmpl
+index b0337995..e88646d7 100644
+--- a/plugin/controllers/views/responsive/main.tmpl
++++ b/plugin/controllers/views/responsive/main.tmpl
+@@ -1,5 +1,5 @@
+ #from Plugins.Extensions.OpenWebif.controllers.i18n import tstrings
+-#from Plugins.Extensions.OpenWebif.controllers.defaults import USERCSSMODERN, MOBILEDEVICE, isSettingEnabled, skinColor, themeMode, showPicons, showPiconBackground
++#from Plugins.Extensions.OpenWebif.controllers.defaults import USERCSSMODERN, isSettingEnabled, skinColor, themeMode, showPicons, showPiconBackground
+ #from Plugins.Extensions.OpenWebif import __version__
+ #from json import dumps
+ 
+@@ -37,7 +37,7 @@
+ 	<meta name="viewport" content="width=device-width, initial-scale=1" /><!-- https://developer.mozilla.org/en-US/docs/Web/HTML/Viewport_meta_tag -->
+ 	<meta name="description" content="">
+ 	<meta name="author" content="">
+-	#if $MOBILEDEVICE == True
++	#if $mobiledevice
+ 	<meta name="apple-itunes-app" content="app-id=574507135">
+ 	#end if
+ 	<link rel="shortcut icon" href="/images/favicon.png">
+@@ -65,7 +65,7 @@
+ 
+ 	<script src="/js/jquery-2.2.4.min.js"></script>
+ 	<script src="/js/jquery-ui-1.13.2.min.js"></script>
+-	<script src="/js/openwebif.min.js?v$__version__"></script>
++	<script src="/js/openwebif.min.js?v=$assetversion"></script>
+ 	<script src="/js/chosen-1.8.7.jquery.min.js"></script>
+ 	<script>initJsTranslation($dumps($tstrings))</script>
+ </head>
+@@ -564,7 +564,11 @@
+ 								<span>$tstrings['gui_theme_mode'] - City Lights</span>
+ 								<div class="switch">
+ 									<label>
+-										<input type="checkbox" name="themeMode" id="thememodebtn" value="city-lights" checked="$(themeMode != 'supabright')">
++										#if $themeMode != 'supabright'
++										<input type="checkbox" name="themeMode" id="thememodebtn" value="city-lights" checked="checked">
++										#else
++										<input type="checkbox" name="themeMode" id="thememodebtn" value="city-lights">
++										#end if
+ 										<span class="lever switch--skinned"></span>
+ 									</label>
+ 								</div>
+@@ -910,11 +914,11 @@
+ ##   .filter((tag) => tag.tagName === 'script')
+ ##   .join('')
+ ## %>
+-<script src="/modern/js/vendors-app.js?v=wp"></script><script src="/modern/js/owif-app.js?v=wp"></script>
++<script src="/modern/js/vendors-app.js?v=$assetversion"></script><script src="/modern/js/owif-app.js?v=$assetversion"></script>
+ 
+ <script src="/modern/js/bootstrap-date-timepicker.min.js"></script>
+-<script src="/modern/js/admin.min.js?v=wp"></script>
+-<script src="/modern/js/responsive.min.js?v1.2.23"></script>
++<script src="/modern/js/admin.min.js?v=$assetversion"></script>
++<script src="/modern/js/responsive.min.js?v=$assetversion"></script>
+ <script>initJsTranslationAddon($dumps($tstrings))</script>
+ 
+ <script>
+diff --git a/plugin/controllers/web.py b/plugin/controllers/web.py
+index b50c67af..14f406c2 100644
+--- a/plugin/controllers/web.py
++++ b/plugin/controllers/web.py
+@@ -33,7 +33,7 @@ from .models.locations import getLocations, getCurrentLocation, addLocation, rem
+ from .models.timers import getTimers, addTimer, addTimerByEventId, editTimer, removeTimer, toggleTimerStatus, cleanupTimer, writeTimerList, recordNow, tvbrowser, getSleepTimer, setSleepTimer, getPowerTimer, setPowerTimer, getVPSChannels
+ from .models.message import sendMessage, getMessageAnswer
+ from .models.movies import getMovieList, removeMovie, getMovieInfo, movieAction, getAllMovies, getMovieDetails, setMovieResumePoint, MOVIETAGFILE
+-from .models.config import cancelConfigBatch, getSettings, addCollapsedMenu, removeCollapsedMenu, saveConfig, saveConfigBatch, getConfigs, getConfigsSections
++from .models.config import _persistConfig, cancelConfigBatch, getSettings, addCollapsedMenu, removeCollapsedMenu, saveConfig, saveConfigBatch, getConfigs, getConfigsSections
+ from .models.stream import getStream, getTS, getStreamSubservices, GetSession
+ from .models.servicelist import reloadServicesLists
+ from .models.mediaplayer import mediaPlayerAdd, mediaPlayerRemove, mediaPlayerPlay, mediaPlayerCommand, mediaPlayerCurrent, mediaPlayerList, mediaPlayerLoad, mediaPlayerSave, mediaPlayerFindFile
+@@ -2537,9 +2537,8 @@ class WebController(BaseController):
+ 	def P_setmoviesort(self, request):
+ 		nsort = getUrlArg(request, "nsort")
+ 		if nsort:
+-			comp_config.OpenWebif.webcache.moviesort.value = nsort
+-			comp_config.OpenWebif.webcache.moviesort.save()
+-		return {}
++			return saveConfig("config.OpenWebif.webcache.moviesort", nsort, True)
++		return {"result": False, "message": "No movie sort provided"}
+ 
+ 	def P_css(self, request):
+ 		request.setHeader("content-type", "text/css")
+@@ -2602,38 +2601,38 @@ class WebController(BaseController):
+ 							resultcfgs.append(cfg)
+ 						else:
+ 							resultcfgs.append(cfg)
+-					return {'configs': resultcfgs}
++					return {"result": cfgs["result"], "configs": resultcfgs, "key": cfgs["key"], "title": cfgs["title"], "message": cfgs["message"]}
+ 			except Exception:
+ 				# TODO show exception
+ 				pass
+ 		return {}
+ 
+ 	def P_setwebconfig(self, request):
+-		args = list(request.args.keys())
+-		for arg in args:
++		for arg in request.args:
+ 			sarg = toString(arg)
+-			if sarg in ("minmovielist", "mintimerlist", "minepglist", "rcu_full_view", "epgsearch_full", "epgsearch_only_bq", "nownext_columns", "responsive_enabled", "showpicons", "showchanneldetails", "showiptvchannelsinselection", "screenshotchannelname", "showallpackages", "showepghistory", "compacttimerlist", "compactepglist", "zapstream", "screenshot_high_resolution", "screenshot_refresh_auto"):
+-				val = request.args[arg][0] in (b"true", b"1")
+-				configitem = getattr(comp_config.OpenWebif.webcache, sarg)
+-				configitem.value = val
+-				configitem.save()
+-				return {"result": True}
++			if sarg in ("minmovielist", "mintimerlist", "minepglist", "rcu_full_view", "rcu_screenshot", "showpiconbackground", "epgsearch_full", "epgsearch_only_bq", "nownext_columns", "responsive_enabled", "showpicons", "showchanneldetails", "showiptvchannelsinselection", "screenshotchannelname", "showallpackages", "showepghistory", "compacttimerlist", "compactepglist", "zapstream", "screenshot_high_resolution", "screenshot_refresh_auto"):
++				value = request.args[arg][0] in (b"true", b"1")
+ 			elif sarg in ("moviedb", "smallremote", "theme", "transcoding_mode"):
+-				try:
+-					configitem = getattr(comp_config.OpenWebif.webcache, sarg)
+-					configitem.value = getUrlArg(request, sarg)
+-					configitem.save()
+-				except Exception:
+-					pass
+-				return {"result": True}
++				value = getUrlArg(request, sarg)
+ 			elif sarg in ("mepgmode", "screenshot_refresh_time"):
+ 				try:
+-					configitem = getattr(comp_config.OpenWebif.webcache, sarg)
+-					configitem.value = int(request.args[arg][0])
+-					configitem.save()
++					value = int(request.args[arg][0])
++				except (ValueError, TypeError):
++					return {"result": False, "message": "Invalid numeric preference"}
++			else:
++				continue
++			try:
++				configitem = getattr(comp_config.OpenWebif.webcache, sarg)
++				previous = configitem.value
++				configitem.value = value
++				try:
++					_persistConfig([configitem])
+ 				except Exception:
+-					pass
+-				return {"result": True}
++					configitem.value = previous
++					raise
++			except Exception as error:
++				return {"result": False, "message": str(error)}
++			return {"result": True}
+ 		return {"result": False}
+ 
+ 	def P_getserviceref(self, request):
+@@ -2699,18 +2698,14 @@ class WebController(BaseController):
+ 	def P_setthememode(self, request):
+ 		thememode = getUrlArg(request, "themeMode")
+ 		if thememode:
+-			print(f"save theme mode: {thememode}")
+-			comp_config.OpenWebif.responsive_themeMode.value = thememode
+-			comp_config.OpenWebif.responsive_themeMode.save()
+-		return {}
++			return saveConfig("config.OpenWebif.responsive_themeMode", thememode, True)
++		return {"result": False, "message": "No theme mode provided"}
+ 
+ 	def P_setskincolor(self, request):
+ 		skincolor = getUrlArg(request, "skincolor")
+ 		if skincolor:
+-			print(f"save color: {skincolor}")
+-			comp_config.OpenWebif.responsive_skinColor.value = skincolor
+-			comp_config.OpenWebif.responsive_skinColor.save()
+-		return {}
++			return saveConfig("config.OpenWebif.responsive_skinColor", skincolor, True)
++		return {"result": False, "message": "No skin color provided"}
+ 
+ 
+ class ApiController(WebController):
+diff --git a/plugin/plugin.py b/plugin/plugin.py
+index 9eabaf22..073eed91 100644
+--- a/plugin/plugin.py
++++ b/plugin/plugin.py
+@@ -176,11 +176,16 @@ class OpenWebifConfig(Setup):
+ 		if config.OpenWebif.https_enabled.value is not True:
+ 			config.OpenWebif.https_clientcert.value = False
+ 
++		Setup.keySave(self)
++
++	def saveAll(self):
++		# Only restart listeners after the configuration was written successfully.
++		quitData = Setup.saveAll(self)
+ 		if config.OpenWebif.enabled.value is True:
+ 			HttpdRestart(global_session)
+ 		else:
+ 			HttpdStop(global_session)
+-		Setup.keySave(self)
++		return quitData
+ 
+ 
+ def confplug(session, **kwargs):
+diff --git a/sourcefiles/js/openwebif.js b/sourcefiles/js/openwebif.js
+index e254c9fa..ac63d26b 100644
+--- a/sourcefiles/js/openwebif.js
++++ b/sourcefiles/js/openwebif.js
+@@ -432,10 +432,16 @@ function load_maincontent_spin(url) {
+ }
+ 
+ function webapi_execute(url, callback) {
+-	let jqxhr = $.ajax({ url: url, cache: false, async: false}).done(function() { 
+-	if (typeof callback !== 'undefined') {
++	$.ajax({ url: url, cache: false, async: false, dataType: 'json'}).done(function(response) {
++		if (response && response.result === false) {
++			configError(response);
++			return;
++		}
++		if (typeof callback !== 'undefined') {
+ 			callback();
+ 		}
++	}).fail(function(jqXHR, textStatus) {
++		alert('Error communicating with server: ' + textStatus);
+ 	});
+ 	return false;
+ }
+@@ -1068,74 +1074,102 @@ function toggleFullRemote() {
+ 	$("#remotecontainer").toggle();
+ }
+ 
++var changedConfigKeys = {};
++var configRequestPending = false;
++
+ function reloadConfigSection(section) {
+-	var url = 'ajax/config?section=' + section;
++	var url = 'ajax/config?section=' + encodeURIComponent(section);
+ 	if (typeof load_scontent === 'function') {
+ 		load_scontent(url);
+ 	} else {
+-		$('#scontent').load(url);
++		$('#scontent').empty().load(url, function() {
++			$('#scontent').find('#content_main').attr('id', 'content_main1');
++		});
+ 	}
+ }
+ 
+-function updateConfig(key, value, section) {
+-	$.ajax({ url: "/api/updateconfig?key=" + encodeURIComponent(key) + "&value=" + encodeURIComponent(value), cache: false, async: true, type: "POST"}).done(function() { 
+-		if (key == "config.usage.setup_level") {
+-			$("#content_container").load(lastcontenturl);
++function configError(response) {
++	alert(response.message || (response.errors || []).join('\n') || 'Unable to apply configuration');
++}
++
++function setConfigBusy(busy) {
++	configRequestPending = busy;
++	$('#scontent [data-config-type], #btn_save, #btn_cancel').prop('disabled', busy);
++}
++
++function updateConfig(key, value, section, save) {
++	if (configRequestPending) {
++		return;
++	}
++	setConfigBusy(true);
++	$.ajax({
++		url: save ? '/api/saveconfig' : '/api/updateconfig',
++		type: 'POST',
++		cache: false,
++		dataType: 'json',
++		data: {key: key, value: value}
++	}).done(function(response) {
++		if (!response.result) {
++			configError(response);
++			return;
+ 		}
+-		else {
++		if (!save) {
++			if (!changedConfigKeys[section]) {
++				changedConfigKeys[section] = [];
++			}
++			if (changedConfigKeys[section].indexOf(key) === -1) {
++				changedConfigKeys[section].push(key);
++			}
++		}
++		if (key === 'config.usage.setup_level') {
++			$('#content_container').load(lastcontenturl);
++		} else {
+ 			reloadConfigSection(section);
+ 		}
++	}).fail(function(jqXHR, textStatus) {
++		alert('Error communicating with server: ' + textStatus);
++	}).always(function() {
++		setConfigBusy(false);
+ 	});
+ }
+ 
+ function saveConfig(key, value, section) {
+-	$.ajax({ url: "/api/saveconfig?key=" + encodeURIComponent(key) + "&value=" + encodeURIComponent(value), cache: false, async: true, type: "POST"}).done(function() { 
+-		if (key == "config.usage.setup_level") {
+-			$("#content_container").load(lastcontenturl);
+-		}
+-		else {
+-			reloadConfigSection(section);
+-		}
+-	});
++	updateConfig(key, value, section, true);
+ }
+ 
+ function batchConfig(section, save) {
+-	var keys = [];
+-
+-	$('#configuration').find('[id][data-config-type]').each(function() {
+-		var elemId = $(this).attr('id');
+-		if (elemId && keys.indexOf(elemId) === -1) {
+-			keys.push(elemId);
++	if (configRequestPending) {
++		return;
++	}
++	// Include edited dependencies even when a conditional rebuild hides them.
++	var keys = (changedConfigKeys[section] || []).slice();
++	$('#scontent [data-config-type]').each(function() {
++		var key = $(this).attr('data-config-group') || this.id;
++		if (key && keys.indexOf(key) === -1) {
++			keys.push(key);
+ 		}
+ 	});
+-
+ 	if (!keys.length) {
+ 		return;
+ 	}
+-
+-	var $btn = save ? $('#btn_save') : $('#btn_cancel');
+-	$btn.prop('disabled', true).text(tstr_saving);
+-
++	setConfigBusy(true);
+ 	$.ajax({
+ 		url: save ? '/api/saveconfigbatch' : '/api/cancelconfigbatch',
+ 		cache: false,
+-		async: true,
+ 		type: 'POST',
+-		data: {
+-			keys: JSON.stringify(keys),
+-			section: section
+-		},
++		data: {keys: JSON.stringify(keys), section: section},
+ 		dataType: 'json'
+ 	}).done(function(response) {
+-		$btn.prop('disabled', false).text(save ? tstr_save : tstr_cancel);
+ 		if (response.result) {
++			delete changedConfigKeys[section];
+ 			reloadConfigSection(section);
+ 		} else {
+-			alert(response.message || 'Error saving configuration');
++			configError(response);
+ 		}
+ 	}).fail(function(jqXHR, textStatus) {
+-		$btn.prop('disabled', false).text(save ? tstr_save : tstr_cancel);
+ 		alert('Error communicating with server: ' + textStatus);
++	}).always(function() {
++		setConfigBusy(false);
+ 	});
+ }
+ 
+@@ -1144,12 +1178,10 @@ function saveAllConfig(section) { batchConfig(section, true); }
+ 
+ 
+ function numberTextboxKeydownFilter(event) {
+-	if (event.keyCode == 46 || event.keyCode == 8 || event.keyCode == 9) {
++	if (event.ctrlKey || event.metaKey || event.altKey || event.key.length > 1 || /^[0-9-]$/.test(event.key)) {
+ 		return;
+ 	}
+-	if ((event.keyCode < 48 || event.keyCode > 57) && (event.keyCode < 96 || event.keyCode > 105)) {
+-		event.preventDefault();
+-	}
++	event.preventDefault();
+ }
+ 
+ /* Timer management start */
+@@ -1967,12 +1999,9 @@ function jumper8001( sref, sname ) {
+ // obsolete
+ function ChangeTheme(theme)
+ {
+-	$.ajax({
+-		url: "api/settheme?theme=" + theme,
+-		success: function() {
+-			window.location.hash = '#settings';
+-			window.location.reload(true);
+-		}
++	webapi_execute("api/setwebconfig?theme=" + encodeURIComponent(theme), function() {
++		window.location.hash = '#settings';
++		window.location.reload(true);
+ 	});
+ }
+ 
+diff --git a/sourcefiles/modern/js/owif.js b/sourcefiles/modern/js/owif.js
+index e3eccc36..55375764 100644
+--- a/sourcefiles/modern/js/owif.js
++++ b/sourcefiles/modern/js/owif.js
+@@ -229,7 +229,7 @@ class GUI {
+     window.onhashchange = locationHashChanged;  
+ 
+     document.querySelectorAll('input[name="skinpref"]').forEach((input) => {
+-      input.onchange = () => {
++      input.onchange = (event) => {
+         self.skinPref = event.target.value;
+       }
+     });
+@@ -260,11 +260,22 @@ class GUI {
+     const cssClassPrefix = 'skin--';
+     const oldValue = self.skinPref;
+ 
+-    // TODO: success/failure message
+-    fetch(`/api/setskincolor?skincolor=${newValue}`);
+-
+-    document.body.classList.replace(`${cssClassPrefix}${oldValue}`, `${cssClassPrefix}${newValue}`);
+-    document.body.dataset.skinpref = newValue;
++    fetch(`/api/setskincolor?skincolor=${encodeURIComponent(newValue)}`)
++      .then((response) => {
++        if (!response.ok) throw new Error(`HTTP ${response.status}`);
++        return response.json();
++      })
++      .then((response) => {
++        if (!response.result) throw new Error(response.message || 'Unable to save skin color');
++        document.body.classList.replace(`${cssClassPrefix}${oldValue}`, `${cssClassPrefix}${newValue}`);
++        document.body.dataset.skinpref = newValue;
++      })
++      .catch((error) => {
++        document.querySelectorAll('input[name="skinpref"]').forEach((input) => {
++          input.checked = input.value === oldValue;
++        });
++        alert(error.message);
++      });
+   }
+ 
+   preparedChoices() {
+diff --git a/sourcefiles/modern/js/responsive.js b/sourcefiles/modern/js/responsive.js
+index f6069193..286b7dbe 100644
+--- a/sourcefiles/modern/js/responsive.js
++++ b/sourcefiles/modern/js/responsive.js
+@@ -1080,82 +1080,81 @@ function WebConfig() {
+ 	
+ 	$('#myepgbtn0').change(function () {
+ 		let fullsearch = $("#myepgbtn0").is(":checked") ? '1' : '0'
+-		$.get('api/setwebconfig?epgsearch_full=' + fullsearch);
++		webapi_execute('api/setwebconfig?epgsearch_full=' + fullsearch);
+ 	});
+ 	
+ 	$('#myepgbtn1').change(function () {
+ 		let bqonly = $("#myepgbtn1").is(":checked") ? '1' : '0'
+-		$.get('api/setwebconfig?epgsearch_only_bq=' + bqonly);
++		webapi_execute('api/setwebconfig?epgsearch_only_bq=' + bqonly);
+ 	});
+ 	
+ 	$('#remotegrabscreen1').change(function () {
+ 		let val = $(this).is(":checked") ? '1' : '0'
+-		$.get('api/setwebconfig?rcu_screenshot=' + val);
++		webapi_execute('api/setwebconfig?rcu_screenshot=' + val);
+ 	});
+ 
+ 	$('#remotecontrolview').change(function () {
+ 		let val = $(this).is(":checked") ? '1' : '0'
+-		$.get('api/setwebconfig?rcu_full_view=' + val);
+-		toggleFullRemote();
++		webapi_execute('api/setwebconfig?rcu_full_view=' + val, toggleFullRemote);
+ 	});
+ 
+ 	$('#minmovielist').change(function () {
+ 		let val = $(this).is(":checked") ? '1' : '0'
+-		$.get('api/setwebconfig?minmovielist=' + val);
+-		if ( lastcontenturl.startsWith('ajax/movies') ) {
+-			load_maincontent_spin_force(lastcontenturl);
+-		}
++		webapi_execute('api/setwebconfig?minmovielist=' + val, function() {
++			if (lastcontenturl.startsWith('ajax/movies')) {
++				load_maincontent_spin_force(lastcontenturl);
++			}
++		});
+ 	});
+ 	$('#mintimerlist').change(function () {
+ 		let val = $(this).is(":checked") ? '1' : '0'
+-		$.get('api/setwebconfig?mintimerlist=' + val);
+-		if ( lastcontenturl === 'ajax/timers') {
+-			lastcontenturl = '';
+-			load_maincontent('ajax/timers');
+-		}
++		webapi_execute('api/setwebconfig?mintimerlist=' + val, function() {
++			if (lastcontenturl === 'ajax/timers') {
++				lastcontenturl = '';
++				load_maincontent('ajax/timers');
++			}
++		});
+ 	});
+ 	$('#minepglist').change(function () {
+ 		let val = $(this).is(":checked") ? '1' : '0'
+-		$.get('api/setwebconfig?minepglist=' + val);
++		webapi_execute('api/setwebconfig?minepglist=' + val);
+ 	});
+ 	$('#zapstream').change(function () {
+ 		let val = $(this).is(":checked") ? '1' : '0'
+-		$.get('api/setwebconfig?zapstream=' + val);
++		webapi_execute('api/setwebconfig?zapstream=' + val);
+ 	});
+ 	$('#showpicons').change(function () {
+ 		let val = $(this).is(":checked") ? '1' : '0'
+-		$.get('api/setwebconfig?showpicons=' + val);
+-		$('#showpiconbackground').prop('disabled', !val);
++		webapi_execute('api/setwebconfig?showpicons=' + val, function() {
++			$('#showpiconbackground').prop('disabled', val === '0');
++		});
+ 	});
+ 	$('#showpiconbackground').change(function () {
+ 		let val = $(this).is(":checked") ? '1' : '0'
+-		$.get('api/setwebconfig?showpiconbackground=' + val);
++		webapi_execute('api/setwebconfig?showpiconbackground=' + val);
+ 	});
+ 	$('#showiptvchannelsinselection').change(function () {
+ 		let val = $(this).is(":checked") ? '1' : '0'
+-		$.get('api/setwebconfig?showiptvchannelsinselection=' + val);
++		webapi_execute('api/setwebconfig?showiptvchannelsinselection=' + val);
+ 	});
+ 
+ 	$('#screenshotchannelname').change(function () {
+ 		let val = $(this).is(":checked") ? '1' : '0'
+-		$.get('api/setwebconfig?screenshotchannelname=' + val);
++		webapi_execute('api/setwebconfig?screenshotchannelname=' + val);
+ 	});
+ 
+ 	$('#thememodebtn').change(function () {
+ 		let themeMode = $(this).is(":checked") ? $(this).val() : 'supabright';
+-		$('body').removeClass(function (index, className) {
+-			return (className.match(/(^|\s)theme--\S+/g) || []).join(' ');
+-		});
+-		if ($(this).is(":checked")) {
++		webapi_execute('api/setthememode?themeMode=' + encodeURIComponent(themeMode), function() {
++			$('body').removeClass(function(index, className) {
++				return (className.match(/(^|\s)theme--\S+/g) || []).join(' ');
++			});
+ 			$('body').addClass('theme--' + themeMode);
+-		} else {
+-			$('body').addClass('theme--' + 'supabright');
+-		}
+-		$.get('api/setthememode?themeMode=' + themeMode);
++		});
+ 	});
+ 	$('#nownext_columns').change(function () {
+ 		let val = $(this).is(":checked") ? '1' : '0'
+-		$.get('api/setwebconfig?nownext_columns=' + val);
++		webapi_execute('api/setwebconfig?nownext_columns=' + val);
+ 	});
+ 
+ }

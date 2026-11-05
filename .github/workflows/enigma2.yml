@@ -34,7 +34,7 @@ jobs:
       DEBIAN_FRONTEND: noninteractive
       BOXTYPE: ${{ github.event.inputs.boxtype || 'u5' }}
       MACHINEBUILD: ${{ github.event.inputs.machinebuild || 'u5' }}
-      E2VER: 8.0.dvbip1002.${{ github.run_number }}~deb${{ matrix.debian }}
+      E2VER: 8.0.dvbip.${{ github.run_number }}~deb${{ matrix.debian }}
       SOURCE_REFS: ${{ github.event.inputs.source_refs || '{}' }}
 
     steps:
@@ -66,9 +66,14 @@ jobs:
         with:
           fetch-depth: 1
 
+
+      - name: Select locked WebUI asset build runtime
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
       # ---- Python 3.13：enigma2 master 已全面采用 PEP 701 f-string 语法（>300 处），
       #      Debian 12 的 python3.11 无法解析，必须自带新解释器 ----
-
       - name: Build Python 3.13 (Debian 12 only)
         if: matrix.debian == '12'
         run: |
@@ -388,6 +393,10 @@ jobs:
           # 运行期依赖：twisted/pyOpenSSL（已带）+ Cheetah（上方 pip 已装 CT3 fork）
           python3 packaging/fetch-source.py clone openwebif /tmp/OpenWebif
           python3 packaging/apply-openwebif.py /tmp/OpenWebif
+          npm ci --prefix /tmp/OpenWebif/sourcefiles --ignore-scripts --no-audit --no-fund
+          npm ci --prefix /tmp/OpenWebif/sourcefiles/modern --ignore-scripts --no-audit --no-fund
+          npm run build-classic-js --prefix /tmp/OpenWebif/sourcefiles
+          npm run build-prod --prefix /tmp/OpenWebif/sourcefiles/modern
           OWIFDIR=${PKGDIR}/usr/local/lib/enigma2/python/Plugins/Extensions/OpenWebif
           mkdir -p ${OWIFDIR}
           cp -a /tmp/OpenWebif/plugin/. ${OWIFDIR}/
@@ -439,7 +448,8 @@ jobs:
 
           cp packaging/enigma2.postinst ${PKGDIR}/DEBIAN/postinst
           chmod 755 ${PKGDIR}/DEBIAN/postinst
-          SKINDEFAULT_SOURCE_DIR=/tmp/skindefault python3 packaging/package-runtime.py enigma2 "${PKGDIR}"
+          E2_SOURCE_COMMIT=$(git -C enigma2 rev-parse HEAD) SKINDEFAULT_SOURCE_DIR=/tmp/skindefault \
+            python3 packaging/package-runtime.py enigma2 "${PKGDIR}"
 
       - name: Upload .deb artifact
         uses: actions/upload-artifact@v4
