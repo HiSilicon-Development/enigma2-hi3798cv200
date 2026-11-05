@@ -1,0 +1,311 @@
+--- a/lib/gdi/fb.cpp
++++ b/lib/gdi/fb.cpp
+@@ -1,3 +1,6 @@
++#ifdef HAVE_HISTB
++#include <lib/driver/histb_drm.h>
++#endif
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <fcntl.h>
+@@ -204,6 +207,26 @@
+ int fbClass::SetMode(int nxRes, int nyRes, int nbpp)
+ {
+ 	if (fbFd < 0) return -1;
++#ifdef HAVE_HISTB
++	// DRM fbdev owns the allocation. The skin selects GP0 source geometry,
++	// not a new fbdev/HDMI mode or a tightly packed replacement buffer.
++	fb_var_screeninfo native = {};
++	fb_fix_screeninfo nativeFix = {};
++	if (ioctl(fbFd, FBIOGET_VSCREENINFO, &native) < 0 || ioctl(fbFd, FBIOGET_FSCREENINFO, &nativeFix) < 0 ||
++		nbpp != 32 || native.bits_per_pixel != 32 || nxRes <= 0 || nyRes <= 0 ||
++		(unsigned int)nxRes > native.xres || (unsigned int)nyRes > native.yres ||
++		nativeFix.line_length < native.xres * 4 || uint64_t(nativeFix.line_length) * native.yres > nativeFix.smem_len ||
++		!histbOsdSetGeometry(nxRes, nyRes))
++	{
++		eWarning("[fb] cannot apply logical canvas %dx%dx%d; retaining previous geometry", nxRes, nyRes, nbpp);
++		return -1;
++	}
++	screeninfo = native;
++	xRes = nxRes; yRes = nyRes; bpp = nbpp;
++	stride = nativeFix.line_length;
++	m_number_of_pages = 1;
++	return 0;
++#endif
+ #ifdef CONFIG_ION
+ 	/* unmap old framebuffer with old size */
+ 	if (lfb)
+@@ -350,6 +373,15 @@
+ 	xres = screeninfo.xres;
+ 	yres = screeninfo.yres;
+ 	bpp = screeninfo.bits_per_pixel;
++#ifdef HAVE_HISTB
++	auto &session = histbDrmSession();
++	std::lock_guard<std::mutex> lock(session.mutex);
++	if (session.sourceW && session.sourceH)
++	{
++		xres = session.sourceW;
++		yres = session.sourceH;
++	}
++#endif
+ }
+ 
+ int fbClass::setOffset(int off)
+--- a/lib/gdi/gfbdc.cpp
++++ b/lib/gdi/gfbdc.cpp
+@@ -55,6 +55,12 @@
+ 	int bpp;
+ 	fb->getMode(xres, yres, bpp);
+ 
++#ifdef HAVE_HISTB
++	/* The boot fbdev may inherit UHD. Before a skin selects its logical
++	 * canvas, choose a supported GP0 source within that existing backing. */
++	if (xres >= 1920 && yres >= 1080) { xres = 1920; yres = 1080; }
++	else if (xres >= 1280 && yres >= 720) { xres = 1280; yres = 720; }
++#else
+ 	/* we can only use one of these three modes: */
+ 	if (!((xres == 720 && yres == 576)
+ 		|| (xres == 1280 && yres == 720)
+@@ -64,6 +70,7 @@
+ 		xres = 720;
+ 		yres = 576;
+ 	}
++#endif
+ 
+ 	surface.clut.data = 0;
+ 	setResolution(xres, yres); // default res
+@@ -426,11 +433,15 @@
+ 	if (grc)
+ 		grc->lock();
+ #endif
++#ifdef HAVE_HISTB
++	if (fb->SetMode(xres, yres, bpp) < 0)
++	{
++		if (m_pixmap) return;
++		eFatal("[gFBDC] cannot initialize native HiSTB OSD geometry");
++		return;
++	}
++#else
+ 	fb->SetMode(xres, yres, bpp);
+-#ifdef HAVE_HISTB
+-	// DRM fbdev can retain the native mode after rejecting the skin's mode.
+-	// Never describe or allocate surfaces using dimensions the driver rejected.
+-	fb->getMode(xres, yres, bpp);
+ #endif
+ 
+ 	unsigned char *base_addr = fb->lfb;
+@@ -504,7 +507,7 @@
+ 
+ 	eDebug("[gFBDC] resolution: %d x %d x %d (stride: %d) pages: %d", surface.x, surface.y, surface.bpp, fb->Stride(), fb->getNumPages());
+ 
+-#ifndef CONFIG_ION
++#if !defined(CONFIG_ION) && !defined(HAVE_HISTB)
+ 	/* accel is already set in fb.cpp */
+ 	eDebug("[gFBDC] %dkB available for acceleration surfaces.", (fb->Available() - fb_size)/1024);
+ 	if (gAccel::getInstance())
+--- a/lib/python/Components/AVSwitch.py
++++ b/lib/python/Components/AVSwitch.py
+@@ -12,6 +12,7 @@
+ MODULE_NAME = __name__.split(".")[-1]
+ AMLOGIC = BoxInfo.getItem("AmlogicFamily")
+ MACHINEBUILD = BoxInfo.getItem("machinebuild")
++HISTB = BoxInfo.getItem("platform") == "hi3798cv200"
+ 
+ config.av = ConfigSubsection()
+ config.av.edid_override = ConfigYesNo(default=False)
+@@ -1024,6 +1025,7 @@
+ 		self.on_hotplug = CList()
+ 		self.current_mode = None
+ 		self.current_port = None
++		self.mode_apply_failed = False
+ 		print(f"[AVSwitch] getAvailableModes: '{eAVControl.getInstance().getAvailableModes()}'.")
+ 		self.is24hzAvailable()
+ 		self.readPreferredModes()
+@@ -1226,7 +1228,17 @@
+ 		eAVControl.getInstance().setInput(input, 1)
+ 
+ 	def setVideoModeDirect(self, mode):
+-		eAVControl.getInstance().setVideoMode(mode)
++		avControl = eAVControl.getInstance()
++		previous = avControl.getVideoMode("") if HISTB else None
++		avControl.setVideoMode(mode)
++		actual = avControl.getVideoMode("") if HISTB else mode
++		self.mode_apply_failed = actual != mode
++		if self.mode_apply_failed:
++			print(f"[AVSwitch] Requested '{mode}', KMS reports '{actual}'; not saving this selection.")
++			if previous and actual != previous:
++				avControl.setVideoMode(previous)
++				print(f"[AVSwitch] Rollback KMS readback: '{avControl.getVideoMode('')}'.")
++		return not self.mode_apply_failed
+ 
+ 	def setMode(self, port, mode, rate, force=None):
+ 		print(f"[AVSwitch] Setting mode for port '{port}', mode '{mode}', rate '{rate}'.")
+@@ -1243,7 +1255,14 @@
+ 			mode24 = mode60
+ 			if force == 50:
+ 				mode24 = mode50
+-		eAVControl.getInstance().setVideoModeMulti(mode50, mode60, mode24, 1)
++		if HISTB:
++			# KMS applies one timing, not three procfs rate slots. In particular,
++			# 25/30 Hz dictionary entries must reach the real modeset unchanged.
++			if not self.setVideoModeDirect(mode50):
++				return False
++		else:
++			eAVControl.getInstance().setVideoModeMulti(mode50, mode60, mode24, 1)
++			self.mode_apply_failed = False
+ 		if eAVControl.getInstance().hasVideoAxis():
+ 			limits = [int(x) for x in eAVControl.getInstance().getVideoAxis(mode).split()]
+ 			config.osd.dst_left.setChoices(default=limits[0], first=limits[0] - 255, last=limits[0] + 255)
+@@ -1254,6 +1273,7 @@
+ 		self.setColorFormat(config.av.colorformat.value)
+ 		self.current_mode = mode
+ 		self.current_port = port
++		return True
+ 
+ 	def setPolicy43(self, configElement):
+ 		eAVControl.getInstance().setPolicy43(configElement.value, 1)
+@@ -1265,6 +1285,8 @@
+ 		eAVControl.getInstance().setWSS(configElement.value, 1)
+ 
+ 	def saveMode(self, port, mode, rate):
++		if HISTB and not self.setMode(port, mode, rate):
++			return False
+ 		config.av.videoport.value = port
+ 		config.av.videoport.save()
+ 		if port in config.av.videomode:
+@@ -1273,6 +1295,7 @@
+ 		if mode in config.av.videorate:
+ 			config.av.videorate[mode].value = rate
+ 			config.av.videorate[mode].save()
++		return True
+ 
+ 
+ # This is a dummy class to stop the constant re-instantiation of the AVSwitchBase class!
+--- a/lib/python/Screens/VideoMode.py
++++ b/lib/python/Screens/VideoMode.py
+@@ -198,6 +198,14 @@
+ 			setrate[configMode].value = configRate
+ 
+ 	def confirm(self, confirmed):
++		if confirmed and BoxInfo.getItem("platform") == "hi3798cv200":
++			port = config.av.videoport.value
++			mode = config.av.videomode[port].value
++			rate = config.av.videorate[mode].value
++			if avSwitch.mode_apply_failed or (config.av.autores.value == "disabled" and
++				eAVControl.getInstance().getVideoMode("") not in avSwitch.rates[mode][rate].values()):
++				confirmed = False
++				self.session.open(MessageBox, _("The requested video mode was not applied. The previous settings have been restored."), MessageBox.TYPE_ERROR)
+ 		if not confirmed:
+ 			if self.resetMode == 1:
+ 				config.av.videoport.value = self.lastGood[0]
+@@ -277,6 +285,10 @@
+ 		else:
+ 			self.resetMode = 0
+ 			Setup.keySave(self)
++			return
++		if avSwitch.mode_apply_failed:
++			self.confirm(False)
++			self.session.open(MessageBox, _("The requested video mode was rejected by the display hardware. The previous settings have been restored."), MessageBox.TYPE_ERROR)
+ 			return
+ 		if BoxInfo.getItem("machinebuild") == "gbquad4kpro" and mode.startswith("2160p"):  # Hack for GB QUAD 4K Pro!
+ 			config.av.hdmicolordepth.value = "10bit"
+@@ -785,9 +797,11 @@
+ 					elif writeMode in ("2160p24", "2160p30", "2160p60"):
+ 						writeMode = "2160p"
+ 				if writeMode in values:
+-					avSwitch.setVideoModeDirect(writeMode)
+-					print(f"[VideoMode] setMode - port: {configPort}, mode: {writeMode} (autoresTyp: '{autorestyp}')")
+-					resolutionlabel["restxt"].setText(_("Video mode: %s") % writeMode)
++					if avSwitch.setVideoModeDirect(writeMode):
++						print(f"[VideoMode] setMode - port: {configPort}, mode: {writeMode} (autoresTyp: '{autorestyp}')")
++						resolutionlabel["restxt"].setText(_("Video mode: %s") % writeMode)
++					else:
++						resolutionlabel["restxt"].setText(_("Video mode: %s not available") % writeMode)
+ 				else:
+ 					print(f"[VideoMode] setMode - port: {configPort}, mode: {writeMode} is not available")
+ 					resolutionlabel["restxt"].setText(_("Video mode: %s not available") % writeMode)
+@@ -809,7 +823,9 @@
+ def manualResolution(session):  # Ad hoc video mode selection from the extensions menu.
+ 	def manualResolutionCallback(choice):
+ 		if choice and choice[1] != oldMode:
+-			avSwitch.setVideoModeDirect(choice[1])
++			if not avSwitch.setVideoModeDirect(choice[1]):
++				session.open(MessageBox, _("The requested video mode was rejected by the display hardware."), MessageBox.TYPE_ERROR)
++				return
+ 			session.openWithCallback(confirmCallback, MessageBox, _("Is this video mode ok?"), MessageBox.TYPE_YESNO, timeout=10, default=False)
+ 
+ 	def confirmCallback(answer):
+--- a/lib/python/Screens/WizardVideo.py
++++ b/lib/python/Screens/WizardVideo.py
+@@ -131,7 +131,8 @@
+ 			return False
+ 		# listRates already prefers multi, but only if all required rates are available.
+ 		self.rate = rates[0][0]
+-		self.setVideoMode(self.port, mode, self.rate)
++		if not self.setVideoMode(self.port, mode, self.rate):
++			return False
+ 
+ 		if BoxInfo.getItem("machinebuild") == "gbquad4kpro" and mode.startswith("2160p"):  # Hack for GB QUAD 4K Pro
+ 			config.av.hdmicolordepth.value = "10bit"
+@@ -149,25 +150,24 @@
+ 
+ 	def rateSelect(self, rate):
+ 		if any(item[0] == rate for item in self.listRates()):
+-			self.setVideoMode(self.port, self.mode, rate)
+-			return True
++			return self.setVideoMode(self.port, self.mode, rate)
+ 		return False
+ 
+ 	def setVideoMode(self, port, mode, rate):
+ 		# Selection changes, OK and entry into the next step can request the same mode.
+ 		videoMode = (port, mode, rate)
+ 		if videoMode != self.lastVideoMode:
+-			avSwitch.setMode(port=port, mode=mode, rate=rate)
++			if not avSwitch.setMode(port=port, mode=mode, rate=rate):
++				return False
+ 			self.lastVideoMode = videoMode
++		return True
+ 
+ 	def keyNumberGlobal(self, number):
+ 		if number in (1, 2, 3):
+-			if number == 1:
+-				avSwitch.saveMode("HDMI", "720p", "multi")
+-			elif number == 2:
+-				avSwitch.saveMode("HDMI", "1080i", "multi")
+-			elif number == 3:
+-				avSwitch.saveMode("Scart", "Multi", "multi")
++			port, mode, rate = {1: ("HDMI", "720p", "multi"), 2: ("HDMI", "1080i", "multi"), 3: ("Scart", "Multi", "multi")}[number]
++			if not avSwitch.saveMode(port, mode, rate):
++				return
++			configfile.save()
+ 			avSwitch.setConfiguredMode()
+ 			self.close()
+ 		Wizard.keyNumberGlobal(self, number)
+@@ -179,7 +179,10 @@
+ 		configfile.save()
+ 
+ 	def saveWizardChanges(self):  # Called by wizardvideo.xml.
+-		avSwitch.saveMode(self.port, self.mode, self.rate)
++		if not avSwitch.saveMode(self.port, self.mode, self.rate):
++			from Screens.MessageBox import MessageBox
++			self.session.open(MessageBox, _("The requested video mode was not applied. Settings were not saved."), MessageBox.TYPE_ERROR)
++			return False
+ 		# config.misc.wizardVideoEnabled.value = 0
+ 		# config.misc.wizardVideoEnabled.save()
+ 		config.misc.videowizardenabled.value = 0
+--- a/lib/python/Screens/WizardStart.py
++++ b/lib/python/Screens/WizardStart.py
+@@ -478,7 +478,13 @@
+ 			elif "1080p" in preferred:
+ 				self.mode = "1080p"
+ 
+-		self.setMode()
++		if BoxInfo.getItem("platform") == "hi3798cv200" and "HDMI" in config.av.videomode:
++			# Do not overwrite a saved KMS timing with the legacy 720p probe.
++			self.mode = config.av.videomode["HDMI"].value
++			avSwitch.setConfiguredMode()
++			preferred = [self.mode]
++		else:
++			self.setMode()
+ 
+ 		if not preferred:
+ 			ports = [port for port in avSwitch.getPortList() if avSwitch.isPortUsed(port)]
