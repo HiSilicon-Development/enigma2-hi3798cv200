@@ -19,6 +19,7 @@ or the previous /usr/local/etc/enigma2 layout is accepted and seeded safely.
 
 import fnmatch
 from hashlib import md5
+from datetime import datetime, timezone
 import os
 from pathlib import Path
 import re
@@ -142,10 +143,12 @@ def library(package, staging, patterns):
 def machine_identity(root):
     path = root / "usr/local/lib/enigma.info"
     source = path if path.is_file() else Path(__file__).with_name("enigma.info")
+    build_date = os.environ.get("E2_BUILD_DATE", datetime.now(timezone.utc).strftime("%Y%m%d"))
+    datetime.strptime(build_date, "%Y%m%d")
     # This is an application port, not an OE firmware image. In particular,
     # never advertise partitions or image files which an updater might flash.
     updates = {
-        "displaybrand": "HiSilicon", "displaymodel": "Hi3798CV200",
+        "displaybrand": "", "displaymodel": "Hi3798CV200",
         "displaydistro": "Debian / OpenATV", "distro": "debian",
         "platform": "hi3798cv200", "friendlyfamily": "hi3798cv200",
         "machinebuild": os.environ.get("MACHINEBUILD", "u5"),
@@ -153,13 +156,19 @@ def machine_identity(root):
         "feedsurl": "", "imagedir": "", "kernel": "", "kernelfile": "",
         "mtdblack": "", "mtdbootfs": "", "mtdkernel": "", "mtdrootfs": "",
         "rootfile": "", "oe": "",
+        "applicationversion": VERSION,
+        "compiledate": build_date, "imagebuild": build_date, "imgrevision": build_date,
+        "imagedevbuild": VERSION, "sourcecommit": os.environ.get("E2_SOURCE_COMMIT", ""),
     }
     lines = []
+    seen = set()
     for line in source.read_text().splitlines():
         key = line.partition("=")[0]
         if key == "checksum":
             continue
+        seen.add(key)
         lines.append(f"{key}={updates[key]!r}" if key in updates else line)
+    lines.extend(f"{key}={value!r}" for key, value in updates.items() if key not in seen)
     # BoxInformation.checkChecksum hashes all non-checksum lines plus a newline.
     payload = "\n".join(lines) + "\n"
     path.parent.mkdir(parents=True, exist_ok=True)
