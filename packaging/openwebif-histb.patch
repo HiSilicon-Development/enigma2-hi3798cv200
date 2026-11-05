@@ -1,3 +1,55 @@
+diff --git a/locale/OpenWebif.pot b/locale/OpenWebif.pot
+index da8851f4..13fb7f2e 100644
+--- a/locale/OpenWebif.pot
++++ b/locale/OpenWebif.pot
+@@ -1513,6 +1513,11 @@ msgstr ""
+ msgid "Open in new window"
+ msgstr ""
+ 
++#: ../plugin/controllers/base.py:368
++#, python-format
++msgid "Opens in a new tab. If prompted, use the %s Webinterface login, separate from OpenWebif."
++msgstr ""
++
+ #: ../plugin/controllers/i18n.py:494
+ msgid "OpenWebif Browser Settings"
+ msgstr ""
+@@ -1772,6 +1777,10 @@ msgstr ""
+ msgid "Screenshot"
+ msgstr ""
+ 
++#: ../plugin/controllers/i18n.py:202
++msgid "Screenshot capture failed. Select OSD to capture menus without video, or retry after playback starts."
++msgstr ""
++
+ #: ../plugin/controllers/i18n.py:620
+ msgid "Script completed"
+ msgstr ""
+diff --git a/locale/zh_CN.po b/locale/zh_CN.po
+index a32b76c0..026aa089 100644
+--- a/locale/zh_CN.po
++++ b/locale/zh_CN.po
+@@ -1129,6 +1129,10 @@ msgstr "Linux 机顶盒的开源 Web 界面"
+ msgid "Open in new window"
+ msgstr "在新窗口中打开"
+ 
++#, python-format
++msgid "Opens in a new tab. If prompted, use the %s Webinterface login, separate from OpenWebif."
++msgstr "将在新标签页打开。如提示登录，请使用 %s 网络界面的登录信息，与 OpenWebif 登录独立。"
++
+ msgid "OpenWebif Browser Settings"
+ msgstr "OpenWebif 浏览器设置"
+ 
+@@ -1322,6 +1326,9 @@ msgstr "加载中..."
+ msgid "Screenshot"
+ msgstr "截图"
+ 
++msgid "Screenshot capture failed. Select OSD to capture menus without video, or retry after playback starts."
++msgstr "截图失败。可选择 OSD 截取菜单；包含视频的截图请在播放开始后重试。"
++
+ msgid "Script completed"
+ msgstr ""
+ 
 diff --git a/plugin/controllers/ajax.py b/plugin/controllers/ajax.py
 index 2c8e6ab2..c6be2f12 100644
 --- a/plugin/controllers/ajax.py
@@ -22,7 +74,7 @@ index 2c8e6ab2..c6be2f12 100644
  			if exists(getPublicPath('themes')):
  				ret['themes'] = config.OpenWebif.webcache.theme.choices
 diff --git a/plugin/controllers/base.py b/plugin/controllers/base.py
-index b1838140..686ecc90 100644
+index b1838140..6c63d3d5 100644
 --- a/plugin/controllers/base.py
 +++ b/plugin/controllers/base.py
 @@ -37,7 +37,7 @@ from Components.SystemInfo import BoxInfo
@@ -125,6 +177,20 @@ index b1838140..686ecc90 100644
  		ret['configsections'] = getConfigsSections()['sections']
  		ret['showname'] = getShowName()['showname']
  		ret['customname'] = getCustomName()['customname']
+@@ -336,10 +365,11 @@ class BaseController(resource.Resource):
+ 
+ 		if oscamwebif and port is not None:
+ 			url = f"{proto}://{request.getRequestHostname()}:{port}"
++			loginhint = _("Opens in a new tab. If prompted, use the %s Webinterface login, separate from OpenWebif.")
+ 			if variant == "oscam":
+-				extras.append({'key': url, 'description': _("OSCam Webinterface"), 'nw': '1'})
++				extras.append({'key': url, 'description': _("OSCam Webinterface"), 'nw': '1', 'loginhint': loginhint % "OSCam"})
+ 			elif variant == "ncam":
+-				extras.append({'key': url, 'description': _("NCam Webinterface"), 'nw': '1'})
++				extras.append({'key': url, 'description': _("NCam Webinterface"), 'nw': '1', 'loginhint': loginhint % "NCam"})
+ 
+ 		if globalVars.hasAutoTimer:
+ 			extras.append({'key': 'ajax/at', 'description': _('AutoTimers')})
 diff --git a/plugin/controllers/defaults.py b/plugin/controllers/defaults.py
 index b7f6511f..c7bc1759 100644
 --- a/plugin/controllers/defaults.py
@@ -650,10 +716,10 @@ index a9bbfb88..d13382b4 100644
  		"result": True,
  		"instandby": inStandby is not None
 diff --git a/plugin/controllers/models/grab.py b/plugin/controllers/models/grab.py
-index 4e0aea91..4f2a0ef5 100644
+index 4e0aea91..b4d6d8cd 100644
 --- a/plugin/controllers/models/grab.py
 +++ b/plugin/controllers/models/grab.py
-@@ -1,123 +1,176 @@
+@@ -1,123 +1,184 @@
  ##########################################################################
  # OpenWebif: grab
 -##########################################################################
@@ -714,6 +780,7 @@ index 4e0aea91..4f2a0ef5 100644
 +		self.container = eConsoleAppContainer()
 +		self.output = SpooledTemporaryFile(max_size=1024 * 1024)
 +		self.size = 0
++		self.stderr = bytearray()
 +		self.error = None
 +		self.finished = False
 +		self.timer = None
@@ -793,6 +860,7 @@ index 4e0aea91..4f2a0ef5 100644
  		self.container.appClosed.append(self.grabFinished)
 -		self.container.stdoutAvail.append(request.write)
 +		self.container.stdoutAvail.append(self.dataReceived)
++		self.container.stderrAvail.append(self.errorReceived)
  		self.container.setBufferSize(32768)
 -		if mode == "lcd":
 -			if self.container.execute(command):
@@ -817,14 +885,15 @@ index 4e0aea91..4f2a0ef5 100644
 -		# request.setHeader('Expires', 'Sat, 26 Jul 1997 05:00:00 GMT')
 -		# request.setHeader('Cache-Control', 'no-store, must-revalidate, post-check=0, pre-check=0')
 -		# request.setHeader('Pragma', 'no-cache')
-+		self.timer = reactor.callLater(15, self.captureTimeout)
-+		if self.container.execute(program, *options):
-+			self.fail(503, "Screenshot backend could not be started")
- 
+-
 -	def requestAborted(self, err):
 -		# Called when client disconnected early, abort the process and
 -		# don't call request.finish()
 -		del self.container.appClosed[:]
++		self.timer = reactor.callLater(15, self.captureTimeout)
++		if self.container.execute(program, *options):
++			self.fail(503, "Screenshot backend could not be started")
++
 +	def dataReceived(self, data):
 +		if self.finished:
 +			return
@@ -834,6 +903,10 @@ index 4e0aea91..4f2a0ef5 100644
 +			self.container.kill()
 +		else:
 +			self.output.write(data)
++
++	def errorReceived(self, data):
++		if not self.finished:
++			self.stderr.extend(data[:max(0, 4096 - len(self.stderr))])
 +
 +	def captureTimeout(self):
 +		self.timer = None
@@ -855,6 +928,7 @@ index 4e0aea91..4f2a0ef5 100644
 +			self.timer.cancel()
 +		del self.container.appClosed[:]
 +		del self.container.stdoutAvail[:]
++		del self.container.stderrAvail[:]
 +		self.output.close()
 +		self.owner.active = None
 +
@@ -883,7 +957,8 @@ index 4e0aea91..4f2a0ef5 100644
 +			(self.fileformat == "png" and header == b"\x89PNG\r\n\x1a\n") or
 +			(self.fileformat == "bmp" and header.startswith(b"BM")))
 +		if retval or self.error or not valid:
-+			self.fail(503, self.error or f"Screenshot backend failed (exit {retval}, {self.size} bytes)")
++			detail = self.stderr.decode("UTF-8", errors="replace").strip()
++			self.fail(503, self.error or detail or f"Screenshot backend failed (exit {retval}, {self.size} bytes)")
 +			return
 +		self.request.setHeader("Content-Type", "image/" + self.fileformat.replace("jpg", "jpeg"))
 +		self.request.setHeader("Content-Disposition", f'inline; filename="{self.filename}"')
@@ -1172,7 +1247,7 @@ index 7abad7f0..e0a88de5 100644
  
  <script type="text/javascript">
 diff --git a/plugin/controllers/views/ajax/screenshot.tmpl b/plugin/controllers/views/ajax/screenshot.tmpl
-index abfadf6e..03f787ce 100644
+index abfadf6e..6da461bc 100644
 --- a/plugin/controllers/views/ajax/screenshot.tmpl
 +++ b/plugin/controllers/views/ajax/screenshot.tmpl
 @@ -16,7 +16,8 @@
@@ -1180,8 +1255,8 @@ index abfadf6e..03f787ce 100644
  		<div class="screenshotContainer">
  			<div id="screenshotImageContainer" style="resize: both;overflow: auto;min-height:480px;min-width:720px">
 -				<img id="screenshotimage" src="" alt="$tstrings['loading'] ..." width="100%">
-+				<img id="screenshotimage" src="" alt="$tstrings['loading'] ..." width="100%" onload="this.style.display='';jQuery('#screenshoterror').hide();" onerror="this.style.display='none';jQuery('#screenshotspinner').hide();jQuery('#screenshoterror').show();">
-+				<p id="screenshoterror" role="status" style="display:none">$tstrings['screenshot_unavailable']</p>
++				<img id="screenshotimage" alt="$tstrings['loading'] ..." width="100%" style="display:none">
++				<p id="screenshoterror" role="status" style="display:none">$tstrings['screenshot_unavailable'] <span id="screenshoterrordetail"></span></p>
  				<div id="screenshotspinnerl" style="top: 50%;left: 50%;margin-left: 50px;margin-top: 50px;;position:absolute;font-size:50px">
  					<div id="screenshotspinner" class='fa fa-spin' style="display: none;"></div>
  				</div>
@@ -1208,10 +1283,23 @@ index 69a7b1e4..a7ecb24b 100644
  		</div>
  		<div id='bookmarks' style="display:none;">
 diff --git a/plugin/controllers/views/main.tmpl b/plugin/controllers/views/main.tmpl
-index a633f248..2f34037f 100644
+index a633f248..f49ecb14 100644
 --- a/plugin/controllers/views/main.tmpl
 +++ b/plugin/controllers/views/main.tmpl
-@@ -359,7 +359,7 @@
+@@ -141,7 +141,11 @@
+ 		#set $target_url = $extra["key"];
+ 		#if 'nw' in $extra
+ 			#if $extra["nw"] == "1"
+-			<li><a href="$target_url" target='_blank'>$extra["description"]</a></li>
++			<li><a href="$target_url" target='_blank'>$extra["description"]</a>
++			#if 'loginhint' in $extra
++				<br/><span>$extra["loginhint"]</span>
++			#end if
++			</li>
+ 			#else
+ 			<li><a class="lmc pop" href="$target_url">$extra["description"]</a></li>
+ 			#end if
+@@ -359,7 +363,7 @@
  
  	<script type="text/javascript" src="js/jquery-2.2.4.min.js"></script>
  	<script type="text/javascript" src="js/jquery-ui-1.13.2.min.js"></script>
@@ -1596,10 +1684,26 @@ index 9eabaf22..073eed91 100644
  
  def confplug(session, **kwargs):
 diff --git a/sourcefiles/js/openwebif.js b/sourcefiles/js/openwebif.js
-index e254c9fa..ac63d26b 100644
+index e254c9fa..ea1cee5b 100644
 --- a/sourcefiles/js/openwebif.js
 +++ b/sourcefiles/js/openwebif.js
-@@ -432,10 +432,16 @@ function load_maincontent_spin(url) {
+@@ -416,6 +416,7 @@ function load_tvcontent_spin(url) {
+ 
+ function load_maincontent(url) {
+ 	if (lastcontenturl != url || ( url.indexOf('screenshot') > -1 ) || ( url.indexOf('timer') > -1 ) || ( url.indexOf('boxinfo') > -1 )) {
++		if (typeof SSHelper.stop === 'function') SSHelper.stop();
+ 		$("#content_container").load(url);
+ 		lastcontenturl = url;
+ 	}
+@@ -424,6 +425,7 @@ function load_maincontent(url) {
+ 
+ function load_maincontent_spin(url) {
+ 	if (lastcontenturl != url) {
++		if (typeof SSHelper.stop === 'function') SSHelper.stop();
+ 		let sp = '<div id="content_main" style="min-height: 500px;">'+loadspinner+'</div>';
+ 		$("#content_container").html(sp).load(url);
+ 		lastcontenturl = url;
+@@ -432,10 +434,16 @@ function load_maincontent_spin(url) {
  }
  
  function webapi_execute(url, callback) {
@@ -1618,7 +1722,100 @@ index e254c9fa..ac63d26b 100644
  	});
  	return false;
  }
-@@ -1068,74 +1074,102 @@ function toggleFullRemote() {
+@@ -869,30 +877,72 @@ function getStatusInfo() {
+ }
+ 
+ function grabScreenshot(mode) {
++	let image = $('#screenshotimage');
++	if (!image.length) return;
++	if (mode != 'auto') screenshotMode = mode;
++	if (SSHelper.captureBusy) {
++		SSHelper.capturePending = true;
++		return;
++	}
++	mode = screenshotMode;
++	SSHelper.captureBusy = true;
+ 	$('#screenshotspinner').show();
+-	
+-	$('#screenshotimage').load(function(){
+-	  $('#screenshotspinner').hide();
+-	});
+-
+-	if (mode != "auto") {
+-		screenshotMode = mode;
+-	} else {
+-		mode = screenshotMode;
++	$('#screenshoterror').hide();
++	$('#screenshoterrordetail').text('');
++	let request = new XMLHttpRequest();
++	SSHelper.captureRequest = request;
++	let url = '/grab?format=jpg&mode=' + mode + '&t=' + new Date().getTime();
++	if (!SSHelper.ssr_hd) url += '&r=720';
++	request.open('GET', url, true);
++	request.responseType = 'blob';
++	request.timeout = 20000;
++	function current() {
++		return SSHelper.captureRequest === request && image[0] === $('#screenshotimage')[0];
+ 	}
+-	timestamp = new Date().getTime();
+-	if (SSHelper.ssr_hd){
+-		$('#screenshotimage').attr("src",'/grab?format=jpg&mode=' + mode + '&t=' + timestamp);
+-	} else {
+-		$('#screenshotimage').attr("src",'/grab?format=jpg&r=720&mode=' + mode + '&t=' + timestamp);
++	function finish() {
++		if (!current()) return;
++		SSHelper.captureRequest = null;
++		SSHelper.captureBusy = false;
++		$('#screenshotspinner').hide();
++		if (SSHelper.capturePending) {
++			SSHelper.capturePending = false;
++			grabScreenshot('auto');
++		}
+ 	}
+-	if (mode == "lcd") {
+-		$('#screenshotimage').css("width", 'auto');
+-		$('#screenshotImageContainer').css("text-align", 'center');
+-	} else {
+-		$('#screenshotimage').css('width', '100%');
+-		$('#screenshotImageContainer').css("text-align", '');
++	function fail(detail) {
++		if (!current()) return;
++		image.hide();
++		$('#screenshoterrordetail').text(detail);
++		$('#screenshoterror').show();
++		finish();
+ 	}
++	request.onload = function() {
++		if (!current()) return;
++		if (request.status !== 200) {
++			let reader = new FileReader();
++			reader.onload = function() {
++				if (!current()) return;
++				fail('HTTP ' + request.status + ': ' + String(reader.result).trim());
++			};
++			reader.onerror = function() { fail('HTTP ' + request.status); };
++			reader.readAsText(request.response);
++			return;
++		}
++		let objectUrl = URL.createObjectURL(request.response);
++		if (SSHelper.captureImageUrl) URL.revokeObjectURL(SSHelper.captureImageUrl);
++		SSHelper.captureImageUrl = objectUrl;
++		image.off('.screenshot').one('load.screenshot', function() {
++			if (!current()) return;
++			image.show().css('width', mode === 'lcd' ? 'auto' : '100%');
++			$('#screenshotImageContainer').css('text-align', mode === 'lcd' ? 'center' : '');
++			$('#screenshoterror').hide();
++			finish();
++		}).one('error.screenshot', function() { fail('HTTP 200: image could not be decoded'); });
++		image.attr('src', objectUrl);
++	};
++	request.onerror = function() { fail('Screenshot request failed: network error'); };
++	request.ontimeout = function() { fail('Screenshot request timed out'); };
++	request.send();
+ }
+ 
+ function getMessageAnswer() {
+@@ -1068,74 +1118,102 @@ function toggleFullRemote() {
  	$("#remotecontainer").toggle();
  }
  
@@ -1755,7 +1952,7 @@ index e254c9fa..ac63d26b 100644
  	});
  }
  
-@@ -1144,12 +1178,10 @@ function saveAllConfig(section) { batchConfig(section, true); }
+@@ -1144,12 +1222,10 @@ function saveAllConfig(section) { batchConfig(section, true); }
  
  
  function numberTextboxKeydownFilter(event) {
@@ -1770,7 +1967,7 @@ index e254c9fa..ac63d26b 100644
  }
  
  /* Timer management start */
-@@ -1967,12 +1999,9 @@ function jumper8001( sref, sname ) {
+@@ -1967,12 +2043,9 @@ function jumper8001( sref, sname ) {
  // obsolete
  function ChangeTheme(theme)
  {
@@ -1786,6 +1983,70 @@ index e254c9fa..ac63d26b 100644
  	});
  }
  
+@@ -2374,15 +2447,13 @@ function testPipStatus() {
+ 
+ var SSHelperObj = function () {
+ 	var self;
+-	var screenshotInterval = false;
+-	var ssr_i = 30;
+-	var ssr_hd = true;
++	var screenshotInterval;
+ 
+ 	return {
+ 		setup: function()
+ 		{
+ 			self = this;
+-			clearInterval(self.screenshotInterval);
++			self.stop();
+ 			self.ssr_i = parseInt($('#ssr_i').val());
+ 			self.ssr_hd = $('#ssr_hd').is(':checked');
+ 			
+@@ -2412,7 +2483,7 @@ var SSHelperObj = function () {
+ 				self.ssr_i = parseInt(t);
+ 				if($('#ssr_s').is(':checked'))
+ 				{
+-					clearInterval(self.screenshotInterval);
++					clearInterval(screenshotInterval);
+ 					self.setSInterval();
+ 				}
+ 			});
+@@ -2423,7 +2494,7 @@ var SSHelperObj = function () {
+ 				if (v) {
+ 					self.setSInterval();
+ 				} else {
+-					clearInterval(self.screenshotInterval); 
++					clearInterval(screenshotInterval);
+ 				}
+ 				webapi_execute("/api/setwebconfig?screenshot_refresh_auto=" + (v ? "true":"false"));
+ 			});
+@@ -2437,7 +2508,26 @@ var SSHelperObj = function () {
+ 
+ 		},setSInterval: function()
+ 		{
+-			self.screenshotInterval = setInterval( function() { testPipStatus(); grabScreenshot('auto'); }, (self.ssr_i+1)*1000);
++			clearInterval(screenshotInterval);
++			screenshotInterval = setInterval(function() {
++				if (!$('#screenshotimage').length) {
++					self.stop();
++					return;
++				}
++				testPipStatus();
++				grabScreenshot('auto');
++			}, (self.ssr_i + 1) * 1000);
++		},stop: function() {
++			clearInterval(screenshotInterval);
++			clearTimeout(grabTimer);
++			let request = this.captureRequest;
++			this.captureRequest = null;
++			if (request) request.abort();
++			this.captureBusy = false;
++			this.capturePending = false;
++			$('#screenshotimage').off('.screenshot');
++			if (this.captureImageUrl) URL.revokeObjectURL(this.captureImageUrl);
++			this.captureImageUrl = null;
+ 		}
+ 	};
+ };
 diff --git a/sourcefiles/modern/js/owif.js b/sourcefiles/modern/js/owif.js
 index e3eccc36..55375764 100644
 --- a/sourcefiles/modern/js/owif.js
