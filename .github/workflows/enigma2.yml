@@ -156,18 +156,11 @@ jobs:
         run: python3 packaging/fetch-source.py clone enigma2 enigma2
 
 
-      # enigma2 上游补丁全部在 .ci/patches/（NN-*.py，按文件名字典序应用），
-      # 改补丁只动 .ci/ 下对应文件，不要编辑本工作流的补丁内容
-      - name: Apply patches (.ci/patches)
+      # One entrypoint owns compatibility, native HiSTB integration, maintained
+      # source patches, then vendor-procfs isolation. Anchors fail on drift.
+      - name: Prepare Enigma2 sources (.ci/apply_patches.py)
         run: python3 .ci/apply_patches.py enigma2
 
-      - name: Apply maintained source patches
-        run: |
-          for patch in "$GITHUB_WORKSPACE"/packaging/patches/*.patch; do
-            [ -f "$patch" ] || continue
-            git -C enigma2 apply --check "$patch"
-            git -C enigma2 apply "$patch"
-          done
 
       - name: Prepare hivxe-ffmpeg headers
         run: |
@@ -262,6 +255,10 @@ jobs:
           cp -a /tmp/e2-staging/* ${PKGDIR}/
           # ---- socketdaemon（NetworkManager 链路状态数据源）----
           cp -a /tmp/sd-staging/usr/local/bin/socketdaemon ${PKGDIR}/usr/local/bin/socketdaemon
+          g++ -std=c++17 -O2 $(pkg-config --cflags libdrm libpng libjpeg) \
+            -Ipackaging packaging/histb-screenshot.cpp \
+            -o ${PKGDIR}/usr/local/bin/histb-screenshot \
+            $(pkg-config --libs libdrm libpng libjpeg)
 
           # enigma2 启动必需的机器信息文件（OE 构建系统产物，BoxInfo 从这里读
           # machinebuild/socfamily 等；checksum 已按 enigma2 md5 算法生成）
@@ -349,47 +346,9 @@ jobs:
           # 3=重启UI 5=出错重启 15/16/17=Kodi等 42-44=升级 45=WOL关机）；
           # 关机/重启同样由退出码驱动。
           mv ${PKGDIR}/usr/local/bin/enigma2 ${PKGDIR}/usr/local/bin/enigma2.bin
-          cat > ${PKGDIR}/usr/local/bin/enigma2 <<'SH'
-          #!/bin/sh
-          # OE enigma2.sh equivalent: UI supervisor loop driven by
-          # quitMainloop exit codes (Screens/Standby.py QUIT_*).
-          # 自带 Python 固定: enigma2 main() 里 setenv PYTHONHOME=/usr
-          # (overwrite=0, OE 生态默认前缀), 在 Debian rootfs 上会被解析到
-          # 系统 stdlib /usr/lib/python3.13 → builtin 集合不匹配缺 math。
-          # export 后 enigma2 不再覆盖, 强制使用自带 /usr/local/lib/python3.13。
-          export PYTHONHOME=/usr/local
-          # 自带 libpython 优先: 一旦系统带入 libpython3.13（如 apt install gdb
-          # 的依赖链），ldconfig 缓存中 /lib/aarch64-linux-gnu 先于
-          # /usr/local/lib，enigma2.bin 会被劫持到系统库 → prefix=/usr →
-          # 系统 stdlib/site.py → 自带 site-packages（twisted/pyusb/CT3/PIL）
-          # 失联 → BSOD 崩溃循环。显式 LD_LIBRARY_PATH 锁定自带库。
-          export LD_LIBRARY_PATH=/usr/local/lib
-          BIN=/usr/local/bin/enigma2.bin
-          # NetworkManager 的 /var/run/netinfo 数据源（链路/网速/流量/因特网
-          # 检测），E2 启动前拉起；daemon 自身绑定固定 socket，重复启动
-          # 会自行退出，无重复实例风险。
-          start-stop-daemon -S -b -x /usr/local/bin/socketdaemon 2>/dev/null
-          while :; do
-              ${BIN} "$@"
-              ret=$?
-              case $ret in
-                  1|45)                    # QUIT_SHUTDOWN / QUIT_WOLSHUTDOWN
-                      poweroff 2>/dev/null || halt
-                      break
-                      ;;
-                  2)                       # QUIT_REBOOT
-                      reboot
-                      break
-                      ;;
-                  3|5|6|15|16|17|42|43|44) # restart UI variants incl. error restart
-                      ;;
-                  *)                       # clean/unknown exit: leave it dead
-                      break
-                      ;;
-              esac
-          done
-          start-stop-daemon -K -x /usr/local/bin/socketdaemon 2>/dev/null
-          SH
+          # The wrapper prioritizes bundled libpython only when the package's
+          # bundled-Python marker exists; Debian 13 keeps system Python.
+          cp packaging/enigma2 ${PKGDIR}/usr/local/bin/enigma2
           chmod 755 ${PKGDIR}/usr/local/bin/enigma2
           if [ '${{ matrix.debian }}' = 12 ]; then
           # 瘦身：测试套件/构建配置/备件不需要
@@ -428,6 +387,7 @@ jobs:
           # WHERE_SESSIONSTART 自动起 Web 服务（默认 80 端口）。
           # 运行期依赖：twisted/pyOpenSSL（已带）+ Cheetah（上方 pip 已装 CT3 fork）
           python3 packaging/fetch-source.py clone openwebif /tmp/OpenWebif
+          python3 packaging/apply-openwebif.py /tmp/OpenWebif
           OWIFDIR=${PKGDIR}/usr/local/lib/enigma2/python/Plugins/Extensions/OpenWebif
           mkdir -p ${OWIFDIR}
           cp -a /tmp/OpenWebif/plugin/. ${OWIFDIR}/
@@ -448,35 +408,8 @@ jobs:
           # Firmware belongs to the target kernel installation. Never ship or
           # overwrite /lib/firmware/hisilicon (or install a kernel/FFmpeg here).
 
-          # ---- fake /var/stb 文件树（配合源码 /proc/stb → /var/stb 重定向）----
-          # 数值节点全部 hex 文本（CFile::parseIntHex 解析）：
-          #   xres=1920(780) yres=1080(438) framerate=50(32) aspect=1(16:9)
-          # dst_* 为画面定位写入目标，初值任意（E2 会重写）。
-          mkdir -p ${PKGDIR}/var/stb/vmpeg/0 ${PKGDIR}/var/stb/video ${PKGDIR}/var/stb/avs/0
-          printf 780 > ${PKGDIR}/var/stb/vmpeg/0/xres
-          printf 438 > ${PKGDIR}/var/stb/vmpeg/0/yres
-          printf 1 > ${PKGDIR}/var/stb/vmpeg/0/aspect
-          printf 32 > ${PKGDIR}/var/stb/vmpeg/0/framerate
-          printf 32 > ${PKGDIR}/var/stb/vmpeg/0/fallback_framerate
-          printf 1 > ${PKGDIR}/var/stb/vmpeg/0/progressive
-          printf 0 > ${PKGDIR}/var/stb/vmpeg/0/dst_top
-          printf 0 > ${PKGDIR}/var/stb/vmpeg/0/dst_left
-          printf 500 > ${PKGDIR}/var/stb/vmpeg/0/dst_width
-          printf 2d0 > ${PKGDIR}/var/stb/vmpeg/0/dst_height
-          printf 0 > ${PKGDIR}/var/stb/vmpeg/0/dst_apply
-          printf ff > ${PKGDIR}/var/stb/video/alpha
-          printf 1 > ${PKGDIR}/var/stb/video/aspect
-          printf bestfit > ${PKGDIR}/var/stb/video/policy
-          printf bestfit > ${PKGDIR}/var/stb/video/policy2
-          printf bestfit > ${PKGDIR}/var/stb/video/policy_choices
-          printf 720p50 > ${PKGDIR}/var/stb/video/videomode
-          printf 720p50 > ${PKGDIR}/var/stb/video/videomode_50hz
-          printf 720p24 > ${PKGDIR}/var/stb/video/videomode_24hz
-          printf 720p60 > ${PKGDIR}/var/stb/video/videomode_60hz
-          printf '720p50 720p25 1080i50 1080p50 2160p50\n' > ${PKGDIR}/var/stb/video/videomode_choices
-          printf encoder > ${PKGDIR}/var/stb/avs/0/input
-          printf encoder > ${PKGDIR}/var/stb/avs/0/input_choices
-          printf Hdmi > ${PKGDIR}/var/stb/avs/0/colorformat
+          # Hardware capabilities and metadata come from actual backends.
+          # Do not ship a simulated /var/stb control tree.
 
           # ---- systemd 开机自启单元 ----
           # enigma2 必须经 supervisor wrapper（/usr/local/bin/enigma2）启动，
@@ -497,6 +430,8 @@ jobs:
           Restart=always
           RestartSec=5
           Environment=HOME=/root
+          RuntimeDirectory=enigma2
+          RuntimeDirectoryMode=0700
 
           [Install]
           WantedBy=multi-user.target
@@ -504,7 +439,7 @@ jobs:
 
           cp packaging/enigma2.postinst ${PKGDIR}/DEBIAN/postinst
           chmod 755 ${PKGDIR}/DEBIAN/postinst
-          python3 packaging/package-runtime.py enigma2 "${PKGDIR}"
+          SKINDEFAULT_SOURCE_DIR=/tmp/skindefault python3 packaging/package-runtime.py enigma2 "${PKGDIR}"
 
       - name: Upload .deb artifact
         uses: actions/upload-artifact@v4
