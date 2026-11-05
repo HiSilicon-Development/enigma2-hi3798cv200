@@ -623,7 +623,7 @@ public:
 		}
 
 		/* 1. zero-copy hardware plane path */
-		if (!m_prime_failed && tryDirectV0(desc, width, height))
+		if (!m_prime_failed && tryDirectV0(desc, width, height, pts))
 			return true;
 
 		/* 2. dumb-buffer copy path on the same plane */
@@ -1042,12 +1042,50 @@ private:
 		m_osd_argb_fb = 0;
 	}
 
+	/* frame-paced presentation shared by both V0 paths: derive the
+	 * frame period from PTS deltas (90 kHz), hold the frame until its
+	 * scheduled slot and advance the slot by one period.  Decode
+	 * bursts (e.g. after TS gaps) are smoothed out; the commit still
+	 * lands on the next vblank, so the display cadence stays
+	 * vblank-aligned (25 fps = every 2nd vblank at 50 Hz).
+	 * presentThread runs this logic on its queue under
+	 * m_present_mutex; the direct PRIME path calls paceToSlot() inline
+	 * from the decode thread (blocking it doubles as backpressure
+	 * into the decoder).  Only one path presents at a time; the
+	 * fallback transition is one-way per stream, so sharing the slot
+	 * state under two narrow mutexes is safe. */
+	void paceToSlot(int64_t pts)
+	{
+		std::lock_guard<std::mutex> l(m_pacer_mutex);
+		if (pts != AV_NOPTS_VALUE && m_last_presented_pts != AV_NOPTS_VALUE)
+		{
+			int64_t d = pts - m_last_presented_pts;
+			if (d < 0)
+				d += (1LL << 33); /* 33-bit PTS wrap */
+			if (d > 900 && d < 90000)
+			{
+				double us = (double)d * 1000000.0 / 90000.0;
+				m_frame_period_us += 0.25 * (us - m_frame_period_us);
+			}
+		}
+		m_last_presented_pts = pts;
+		auto now = std::chrono::steady_clock::now();
+		if (m_pacer_slot.time_since_epoch().count() == 0)
+			m_pacer_slot = now; /* first frame after (re)start */
+		if (now < m_pacer_slot)
+			std::this_thread::sleep_until(m_pacer_slot);
+		now = std::chrono::steady_clock::now();
+		if (now > m_pacer_slot + std::chrono::microseconds((int64_t)m_frame_period_us / 2))
+			m_pacer_slot = now; /* late (stall/gap): resync */
+		m_pacer_slot += std::chrono::microseconds((int64_t)m_frame_period_us);
+	}
+
 	/* Path 1: zero-copy PRIME import onto the V0 plane.  The native KMS
 	 * histb-vdp imports the decoder dmabuf (contiguous buffers scan out
 	 * directly; scattered ones are copied by the driver into a shadow),
 	 * scales through ZME and converts through VDM Y2R in hardware, and
 	 * composes the video below the G0 OSD plane. */
-	bool tryDirectV0(const AVDRMFrameDescriptor *desc, int width, int height)
+	bool tryDirectV0(const AVDRMFrameDescriptor *desc, int width, int height, int64_t pts)
 	{
 		if (!m_v0_plane_id)
 		{
@@ -1092,6 +1130,12 @@ private:
 		 * alignment mask); round down odd stream sizes */
 		uint32_t sw = (uint32_t)width & ~1u;
 		uint32_t sh = (uint32_t)height & ~1u;
+		/* pace the presentation: the vendor demux tap delivers decode
+		 * input in large periodic bursts, so presenting every decoded
+		 * frame as it arrives makes the cadence bursty.  Hold the
+		 * frame until its scheduled slot (same logic as presentThread)
+		 * before committing it to the plane. */
+		paceToSlot(pts);
 		ret = drmModeSetPlane(m_fd, m_v0_plane_id, m_crtc_id, fb,
 			0, 0, 0, m_width, m_height,
 			0, 0, sw << 16, sh << 16);
@@ -2027,7 +2071,8 @@ private:
 	std::atomic<bool> m_present_busy{false};
 	std::atomic<bool> m_present_stop{false};
 	bool m_present_running = false;
-	/* frame-paced presentation state (see presentThread) */
+	/* frame-paced presentation state (see paceToSlot) */
+	std::mutex m_pacer_mutex;
 	std::chrono::steady_clock::time_point m_pacer_slot{};
 	int64_t m_last_presented_pts = AV_NOPTS_VALUE;
 	double m_frame_period_us = 40000.0;
