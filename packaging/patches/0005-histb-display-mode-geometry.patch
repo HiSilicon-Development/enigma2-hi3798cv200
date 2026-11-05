@@ -164,7 +164,36 @@
  		print(f"[AVSwitch] getAvailableModes: '{eAVControl.getInstance().getAvailableModes()}'.")
  		self.is24hzAvailable()
  		self.readPreferredModes()
-@@ -1082,42 +1114,64 @@
+@@ -1038,7 +1070,14 @@
+ 
+ 	def readPreferredModes(self, saveMode=False, readOnly=False):
+ 		modes = ""
+-		if config.av.edid_override.value is False:
++		if HISTB:
++			# One or two real timings are valid capabilities, not a driver failure.
++			# Never broaden them or bypass the sink when EDID is unavailable.
++			modes = eAVControl.getInstance().getPreferredModes(1)
++			self.modes_preferred = list(dict.fromkeys(modes.split()))
++			if saveMode:
++				return self.modes_preferred[:]
++		elif config.av.edid_override.value is False:
+ 			modes = eAVControl.getInstance().getPreferredModes(1)
+ 			if saveMode:
+ 				modes = modes.split()
+@@ -1047,10 +1086,10 @@
+ 			print(f"[AVSwitch] getPreferredModes: '{modes}'.")
+ 			seen = set()
+ 			self.modes_preferred = [m for m in modes.split() if 'x' not in m and not (m in seen or seen.add(m))]  # Remove duplicates and modes with 'x' in the name, which are not real modes.
+-		if len(modes) < 2:
++		if not HISTB and len(modes) < 2:
+ 			self.modes_preferred = self.readAvailableModes()
+ 			print(f"[AVSwitch] Used default modes: {self.modes_preferred}.")
+-		if len(self.modes_preferred) <= 2:
++		if not HISTB and len(self.modes_preferred) <= 2:
+ 			print(f"[AVSwitch] Preferend modes not okay, possible driver failer, length={len(self.modes_preferred)}.")
+ 			self.modes_preferred = self.readAvailableModes()
+ 		if readOnly:
+@@ -1082,42 +1121,64 @@
  
  		return self.axis.get(mode, self.axis["720p"])
  
@@ -257,7 +286,7 @@
  		config.av.aspectswitch = ConfigSubsection()
  		config.av.aspectswitch.enabled = ConfigYesNo(default=False)
  		defaults = (  # The preset values for the offset heights.
-@@ -1172,7 +1226,7 @@
+@@ -1172,7 +1233,7 @@
  		results = []
  		availableModes = self.readAvailableModes()
  		for mode in self.modes[port]:
@@ -266,7 +295,7 @@
  			if len(rates):  # If at least one rate is OK then add this mode.
  				results.append((mode, rates))
  		return results
-@@ -1226,7 +1280,17 @@
+@@ -1226,7 +1287,17 @@
  		eAVControl.getInstance().setInput(input, 1)
  
  	def setVideoModeDirect(self, mode):
@@ -285,7 +314,7 @@
  
  	def setMode(self, port, mode, rate, force=None):
  		print(f"[AVSwitch] Setting mode for port '{port}', mode '{mode}', rate '{rate}'.")
-@@ -1243,7 +1307,14 @@
+@@ -1243,7 +1314,14 @@
  			mode24 = mode60
  			if force == 50:
  				mode24 = mode50
@@ -301,7 +330,7 @@
  		if eAVControl.getInstance().hasVideoAxis():
  			limits = [int(x) for x in eAVControl.getInstance().getVideoAxis(mode).split()]
  			config.osd.dst_left.setChoices(default=limits[0], first=limits[0] - 255, last=limits[0] + 255)
-@@ -1254,6 +1325,7 @@
+@@ -1254,6 +1332,7 @@
  		self.setColorFormat(config.av.colorformat.value)
  		self.current_mode = mode
  		self.current_port = port
@@ -309,7 +338,7 @@
  
  	def setPolicy43(self, configElement):
  		eAVControl.getInstance().setPolicy43(configElement.value, 1)
-@@ -1265,6 +1337,10 @@
+@@ -1265,6 +1344,10 @@
  		eAVControl.getInstance().setWSS(configElement.value, 1)
  
  	def saveMode(self, port, mode, rate):
@@ -320,7 +349,7 @@
  		config.av.videoport.value = port
  		config.av.videoport.save()
  		if port in config.av.videomode:
-@@ -1273,6 +1349,7 @@
+@@ -1273,6 +1356,7 @@
  		if mode in config.av.videorate:
  			config.av.videorate[mode].value = rate
  			config.av.videorate[mode].save()
@@ -328,7 +357,7 @@
  
  
  # This is a dummy class to stop the constant re-instantiation of the AVSwitchBase class!
-@@ -1304,6 +1381,9 @@
+@@ -1304,6 +1388,9 @@
  def InitiVideomodeHotplug(**kwargs):
  	global hotplug
  	hotplug = VideomodeHotplug()
@@ -338,7 +367,7 @@
  
  
  class VideomodeHotplug:
-@@ -1319,6 +1399,8 @@
+@@ -1319,6 +1406,8 @@
  	def hotplug(self, what):
  		print(f"[AVSwitch] Hot-plug detected on port '{what}'.")
  		port = config.av.videoport.value
@@ -367,7 +396,17 @@
  					self.getVerifyVideomode(config.av.autores_mode_uhd, config.av.autores_rate_uhd)
  					items.extend((
  						(pgettext(_("Video output mode for UHD"), _("%sMode for UHD (up to 2160p)") % self.prevUhd), config.av.autores_mode_uhd[port], _("This option configures the video output mode (or resolution)."), "check_uhd"),
-@@ -198,6 +198,17 @@
+@@ -175,7 +175,8 @@
+ 				if config.av.aspectswitch.enabled.value:
+ 					for aspect in range(5):
+ 						items.append((f" -> {avSwitch.ASPECT_SWITCH_MSG[aspect]}", config.av.aspectswitch.offsets[str(aspect)]))
+-			items.append((_("Allow unsupported modes"), config.av.edid_override, _("This option allows you to use all HDMI Modes.")))
++			if BoxInfo.getItem("platform") != "hi3798cv200":
++				items.append((_("Allow unsupported modes"), config.av.edid_override, _("This option allows you to use all HDMI Modes.")))
+ 		if port == "Scart":
+ 			items.append((_("Color format"), config.av.colorformat, _("Configure which color format should be used on the SCART output.")))
+ 			if level >= 1:
+@@ -198,6 +199,17 @@
  			setrate[configMode].value = configRate
  
  	def confirm(self, confirmed):
@@ -385,7 +424,7 @@
  		if not confirmed:
  			if self.resetMode == 1:
  				config.av.videoport.value = self.lastGood[0]
-@@ -231,6 +242,9 @@
+@@ -231,6 +243,9 @@
  	def grabLastGoodMode(self):
  		self.resetMode = 0
  		port = config.av.videoport.value
@@ -395,7 +434,7 @@
  		mode = config.av.videomode[port].value
  		rate = config.av.videorate[mode].value
  		self.lastGood = (port, mode, rate)
-@@ -251,6 +265,11 @@
+@@ -251,6 +266,11 @@
  
  	def keySave(self):
  		port = config.av.videoport.value
@@ -407,7 +446,7 @@
  		mode = config.av.videomode[port].value
  		rate = config.av.videorate[mode].value
  		autoresSd = config.av.autores_sd.value
-@@ -278,6 +297,10 @@
+@@ -278,6 +298,10 @@
  			self.resetMode = 0
  			Setup.keySave(self)
  			return
@@ -418,7 +457,7 @@
  		if BoxInfo.getItem("machinebuild") == "gbquad4kpro" and mode.startswith("2160p"):  # Hack for GB QUAD 4K Pro!
  			config.av.hdmicolordepth.value = "10bit"
  			config.av.hdmicolordepth.save()
-@@ -287,7 +310,7 @@
+@@ -287,7 +311,7 @@
  		return eAVControl.getInstance().getVideoMode("") or None
  
  	def changedEntry(self):
@@ -427,7 +466,7 @@
  			ConfigListScreen.changedEntry(self)
  			cur = self["config"].getCurrent()
  			cur = cur and len(cur) > 3 and cur[3]
-@@ -499,6 +522,8 @@
+@@ -499,6 +523,8 @@
  	def VideoChangeDetect(self):
  		# Info: Auto resolution preview or save settings call this function with session = None / ~338, ~374.
  		global resolutionlabel
@@ -436,7 +475,7 @@
  		avControl = eAVControl.getInstance()
  		configPort, configMode, configRes, configPol, configRate = self.getConfigVideomode(config.av.videomode, config.av.videorate)
  		configMode = configMode.replace("p30", "p")
-@@ -785,9 +810,11 @@
+@@ -785,9 +811,11 @@
  					elif writeMode in ("2160p24", "2160p30", "2160p60"):
  						writeMode = "2160p"
  				if writeMode in values:
@@ -451,7 +490,7 @@
  				else:
  					print(f"[VideoMode] setMode - port: {configPort}, mode: {writeMode} is not available")
  					resolutionlabel["restxt"].setText(_("Video mode: %s not available") % writeMode)
-@@ -809,7 +836,9 @@
+@@ -809,7 +837,9 @@
  def manualResolution(session):  # Ad hoc video mode selection from the extensions menu.
  	def manualResolutionCallback(choice):
  		if choice and choice[1] != oldMode:

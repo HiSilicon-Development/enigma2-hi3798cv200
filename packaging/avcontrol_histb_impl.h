@@ -128,13 +128,23 @@ static bool histbFindDrmMode(drmModeConnectorPtr conn, const HistbModeSpec &spec
 }
 
 
+/* KMS may supply conservative fallback modes when no valid sink EDID exists.
+ * Those are not display capabilities and must not enter selection or apply. */
+static bool histbHasEdid(drmModeConnectorPtr conn)
+{
+ uint64_t blob = 0;
+ auto &s = histbDrmSession();
+ return conn->connection == DRM_MODE_CONNECTED &&
+  histbDrmProperty(s.fd, conn->connector_id, DRM_MODE_OBJECT_CONNECTOR, "EDID", &blob) && blob;
+}
+
 static std::string histbReadEdidModes()
 {
  auto &s = histbDrmSession();
  std::lock_guard<std::mutex> lock(s.mutex);
  if (histbDrmOpen() < 0) return "";
  drmModeConnectorPtr conn = drmModeGetConnector(s.fd, s.connector);
- if (!conn) return "";
+ if (!conn || !histbHasEdid(conn)) { if (conn) drmModeFreeConnector(conn); return ""; }
  std::vector<std::string> names;
  std::string result;
  for (int i = 0; i < conn->count_modes; ++i)
@@ -161,7 +171,7 @@ static bool histbSetVideoMode(const std::string &name, int flags)
  drmModeConnectorPtr conn = drmModeGetConnector(s.fd, s.connector);
  if (!conn) return false;
  drmModeModeInfo mode = {};
- bool ok = histbFindDrmMode(conn, spec, mode);
+ bool ok = histbHasEdid(conn) && histbFindDrmMode(conn, spec, mode);
  drmModeFreeConnector(conn);
  if (ok) ok = histbDrmSetMode(mode);
  if (ok) eDebug("[eAVControl] histb: %s applied (%dx%d @ %d)", name.c_str(), spec.w, spec.h, spec.refresh);
