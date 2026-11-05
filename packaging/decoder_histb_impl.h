@@ -612,7 +612,8 @@ public:
 	 *   3. PRIME import -> AddFB2(NV12) -> legacy CRTC flip (old
 	 *      simple-pipe histb-vdp with no KMS planes at all);
 	 *   4. mmap -> sws NV12->XRGB8888 dumb buffer -> legacy CRTC flip. */
-	bool showFrame(const AVDRMFrameDescriptor *desc, int width, int height, int64_t pts)
+	bool showFrame(const AVDRMFrameDescriptor *desc, int width, int height,
+		int64_t pts, AVFrame *hold)
 	{
 		if (m_fd < 0 || !desc || desc->nb_layers < 1 || desc->nb_objects < 1)
 			return false;
@@ -623,7 +624,7 @@ public:
 		}
 
 		/* 1. zero-copy hardware plane path */
-		if (!m_prime_failed && tryDirectV0(desc, width, height, pts))
+		if (!m_prime_failed && tryDirectV0(desc, width, height, pts, hold))
 			return true;
 
 		/* 2. dumb-buffer copy path on the same plane */
@@ -797,6 +798,7 @@ public:
 			drmModeSetPlane(m_fd, m_v0_plane_id, m_crtc_id, 0,
 				0, 0, 0, 0, 0, 0, 0, 0, 0);
 		retireFrame();
+		releasePrimeItem(m_prime_onscreen);
 		m_fb_bound = false;
 	}
 
@@ -1048,44 +1050,18 @@ private:
 	 * bursts (e.g. after TS gaps) are smoothed out; the commit still
 	 * lands on the next vblank, so the display cadence stays
 	 * vblank-aligned (25 fps = every 2nd vblank at 50 Hz).
-	 * presentThread runs this logic on its queue under
-	 * m_present_mutex; the direct PRIME path calls paceToSlot() inline
-	 * from the decode thread (blocking it doubles as backpressure
-	 * into the decoder).  Only one path presents at a time; the
-	 * fallback transition is one-way per stream, so sharing the slot
-	 * state under two narrow mutexes is safe. */
-	void paceToSlot(int64_t pts)
-	{
-		std::lock_guard<std::mutex> l(m_pacer_mutex);
-		if (pts != AV_NOPTS_VALUE && m_last_presented_pts != AV_NOPTS_VALUE)
-		{
-			int64_t d = pts - m_last_presented_pts;
-			if (d < 0)
-				d += (1LL << 33); /* 33-bit PTS wrap */
-			if (d > 900 && d < 90000)
-			{
-				double us = (double)d * 1000000.0 / 90000.0;
-				m_frame_period_us += 0.25 * (us - m_frame_period_us);
-			}
-		}
-		m_last_presented_pts = pts;
-		auto now = std::chrono::steady_clock::now();
-		if (m_pacer_slot.time_since_epoch().count() == 0)
-			m_pacer_slot = now; /* first frame after (re)start */
-		if (now < m_pacer_slot)
-			std::this_thread::sleep_until(m_pacer_slot);
-		now = std::chrono::steady_clock::now();
-		if (now > m_pacer_slot + std::chrono::microseconds((int64_t)m_frame_period_us / 2))
-			m_pacer_slot = now; /* late (stall/gap): resync */
-		m_pacer_slot += std::chrono::microseconds((int64_t)m_frame_period_us);
-	}
+	 * presentThread is the single pacing point: all presentation paths
+	 * stage their output for it and it alone advances the slot state
+	 * under m_present_mutex.  Only one path produces at a time; the
+	 * fallback transition is one-way per stream. */
 
 	/* Path 1: zero-copy PRIME import onto the V0 plane.  The native KMS
 	 * histb-vdp imports the decoder dmabuf (contiguous buffers scan out
 	 * directly; scattered ones are copied by the driver into a shadow),
 	 * scales through ZME and converts through VDM Y2R in hardware, and
 	 * composes the video below the G0 OSD plane. */
-	bool tryDirectV0(const AVDRMFrameDescriptor *desc, int width, int height, int64_t pts)
+	bool tryDirectV0(const AVDRMFrameDescriptor *desc, int width, int height,
+		int64_t pts, AVFrame *hold)
 	{
 		if (!m_v0_plane_id)
 		{
@@ -1126,42 +1102,47 @@ private:
 			m_prime_failed = true;
 			return false;
 		}
-		/* V0 plane check requires even source geometry (2<<16 - 1
-		 * alignment mask); round down odd stream sizes */
-		uint32_t sw = (uint32_t)width & ~1u;
-		uint32_t sh = (uint32_t)height & ~1u;
-		/* pace the presentation: the vendor demux tap delivers decode
-		 * input in large periodic bursts, so presenting every decoded
-		 * frame as it arrives makes the cadence bursty.  Hold the
-		 * frame until its scheduled slot (same logic as presentThread)
-		 * before committing it to the plane. */
-		paceToSlot(pts);
-		ret = drmModeSetPlane(m_fd, m_v0_plane_id, m_crtc_id, fb,
-			0, 0, 0, m_width, m_height,
-			0, 0, sw << 16, sh << 16);
-		if (ret < 0)
+
+		/* Stage the prepared fb for the present thread instead of
+		 * committing inline: the vendor demux tap delivers input in
+		 * large periodic bursts, so the decode thread must stay free
+		 * to read ahead while the present thread paces frames out at
+		 * the frame period.  Each queued item pins one AVFrame
+		 * reference so the v4l2 capture buffer cannot be recycled
+		 * underneath the queued fb. */
+		startPresentThread();
 		{
-			static int spwarned = 0;
-			if (!spwarned++)
-				eDebug("[histb-dec] SetPlane(V0, PRIME) failed (%s), trying dumb path",
-					strerror(errno));
-			drmModeRmFB(m_fd, fb);
-			unmapHandles(handles);
-			/* transient (master race, mode re-set): retry next frame */
-			return false;
+			std::unique_lock<std::mutex> l(m_present_mutex);
+			m_present_cv.wait(l, [&] {
+				return m_present_stop.load() ||
+					m_prime_queue.size() < kPrimeQueueMax;
+			});
+			if (m_present_stop.load())
+			{
+				drmModeRmFB(m_fd, fb);
+				unmapHandles(handles);
+				return true;
+			}
+			PrimeItem it;
+			it.fb = fb;
+			memcpy(it.handles, handles, sizeof(handles));
+			it.nh = nh;
+			it.pts = pts;
+			it.w = width;
+			it.h = height;
+			if (hold)
+			{
+				it.held = av_frame_alloc();
+				if (!it.held || av_frame_ref(it.held, hold) < 0)
+				{
+					av_frame_free(&it.held);
+					drmModeRmFB(m_fd, fb);
+					unmapHandles(handles);
+					return true;
+				}
+			}
+			m_prime_queue.push_back(it);
 		}
-		/* the fb from two flips ago may still be scanned out until this
-		 * flip takes effect at vblank; free it one frame later */
-		if (m_prev_fb)
-		{
-			drmModeRmFB(m_fd, m_prev_fb);
-			m_prev_fb = 0;
-		}
-		unmapHandles(m_prev_handles);
-		m_prev_fb = m_fb;
-		memcpy(m_prev_handles, m_gem_handles, sizeof(m_gem_handles));
-		m_fb = fb;
-		memcpy(m_gem_handles, handles, sizeof(handles));
 		if (!m_prime_presented)
 		{
 			m_prime_presented = true;
@@ -1437,6 +1418,12 @@ private:
 			m_present_queue.clear();
 			std::fill(m_v0_free.begin(), m_v0_free.end(), 1);
 			m_v0_onscreen = -1;
+			while (!m_prime_queue.empty())
+			{
+				releasePrimeItem(m_prime_queue.front());
+				m_prime_queue.pop_front();
+			}
+			releasePrimeItem(m_prime_onscreen);
 		}
 	}
 
@@ -1451,6 +1438,13 @@ private:
 			for (int idx : m_present_queue)
 				m_v0_free[idx] = 1;
 			m_present_queue.clear();
+			/* staged prime fbs: release resources; the on-screen one
+			 * is freed by hide() after the plane is blanked */
+			while (!m_prime_queue.empty())
+			{
+				releasePrimeItem(m_prime_queue.front());
+				m_prime_queue.pop_front();
+			}
 		}
 		m_present_cv.notify_all();
 		/* wait until a commit already taken by the thread is done
@@ -1601,20 +1595,73 @@ private:
 		return ok;
 	}
 
+	/* present-thread side: release a staged or retired PRIME item */
+	void releasePrimeItem(PrimeItem &it)
+	{
+		if (it.fb)
+		{
+			drmModeRmFB(m_fd, it.fb);
+			it.fb = 0;
+		}
+		unmapHandles(it.handles);
+		it.nh = 0;
+		if (it.held)
+			av_frame_free(&it.held);
+	}
+
+	/* present-thread side: commit one staged PRIME fb to the V0 plane
+	 * (source rect even-aligned; SetPlane lands on the next vblank) */
+	bool commitPrime(const PrimeItem &it)
+	{
+		uint32_t sw = (uint32_t)it.w & ~1u;
+		uint32_t sh = (uint32_t)it.h & ~1u;
+		int ret = drmModeSetPlane(m_fd, m_v0_plane_id, m_crtc_id, it.fb,
+			0, 0, 0, m_width, m_height, 0, 0, sw << 16, sh << 16);
+		if (ret < 0)
+		{
+			static int spwarned = 0;
+			if (!spwarned++)
+				eDebug("[histb-dec] SetPlane(V0, PRIME) failed (%s)",
+					strerror(errno));
+			return false;
+		}
+		return true;
+	}
+
 	void presentThread()
 	{
 		std::unique_lock<std::mutex> lock(m_present_mutex);
 		for (;;)
 		{
-			m_present_cv.wait(lock, [&] { return m_present_stop || !m_present_queue.empty(); });
-			if (m_present_queue.empty())
+			m_present_cv.wait(lock, [&] {
+				return m_present_stop || !m_present_queue.empty() ||
+					!m_prime_queue.empty();
+			});
+			if (m_present_queue.empty() && m_prime_queue.empty())
 			{
 				if (m_present_stop)
 					break;
 				continue;
 			}
-			int idx = m_present_queue.front();
-			m_present_queue.pop_front();
+			/* pop: a staged PRIME fb first (it is ahead in decode
+			 * time), else a dumb-pool index */
+			PrimeItem pit;
+			int idx = -1;
+			int64_t pts;
+			bool prime = !m_prime_queue.empty();
+			if (prime)
+			{
+				pit = m_prime_queue.front();
+				m_prime_queue.pop_front();
+				pts = pit.pts;
+			}
+			else
+			{
+				idx = m_present_queue.front();
+				m_present_queue.pop_front();
+				pts = m_v0_buf[idx].pts;
+			}
+			m_present_cv.notify_all(); /* queue space freed */
 			m_present_busy = true; /* in flight: pacing counts too */
 			/* frame-paced presentation: derive the frame period from
 			 * PTS deltas (90 kHz), hold each frame until its scheduled
@@ -1622,10 +1669,9 @@ private:
 			 * (e.g. after TS gaps) are smoothed out; the commit still
 			 * lands on the next vblank, so the display cadence stays
 			 * vblank-aligned (25 fps = every 2nd vblank at 50 Hz). */
-			V0Buf &b = m_v0_buf[idx];
-			if (b.pts != AV_NOPTS_VALUE && m_last_presented_pts != AV_NOPTS_VALUE)
+			if (pts != AV_NOPTS_VALUE && m_last_presented_pts != AV_NOPTS_VALUE)
 			{
-				int64_t d = b.pts - m_last_presented_pts;
+				int64_t d = pts - m_last_presented_pts;
 				if (d < 0)
 					d += (1LL << 33); /* 33-bit PTS wrap */
 				if (d > 900 && d < 90000)
@@ -1634,7 +1680,7 @@ private:
 					m_frame_period_us += 0.25 * (us - m_frame_period_us);
 				}
 			}
-			m_last_presented_pts = b.pts;
+			m_last_presented_pts = pts;
 			auto now = std::chrono::steady_clock::now();
 			if (m_pacer_slot.time_since_epoch().count() == 0)
 				m_pacer_slot = now; /* first frame after (re)start */
@@ -1648,32 +1694,48 @@ private:
 				m_pacer_slot = now; /* late (stall/gap): resync */
 			m_pacer_slot += std::chrono::microseconds((int64_t)m_frame_period_us);
 			lock.unlock();
-			bool ok = commitV0(idx);
+			bool ok = prime ? commitPrime(pit) : commitV0(idx);
 			m_present_busy = false;
 			lock.lock();
 			if (ok)
 			{
-				/* idx is on screen now; the previously displayed
-				 * buffer left scanout at this flip and may be
-				 * rewritten by the decoder */
-				int prev = m_v0_onscreen;
-				m_v0_onscreen = idx;
-				if (prev >= 0)
-					m_v0_free[prev] = 1;
-				V0Buf &b = m_v0_buf[idx];
-				if (!m_v0_presented)
+				if (prime)
 				{
-					m_v0_presented = true;
-					eDebug("[histb-dec] first V0 frame presented %dx%d -> %dx%d",
-						b.w, b.h, m_width, m_height);
+					/* pit is on screen now; the previously displayed
+					 * PRIME fb left scanout (one-flip deferral, same
+					 * as the old inline path) */
+					releasePrimeItem(m_prime_onscreen);
+					m_prime_onscreen = pit;
 				}
-				unsigned frames = ++m_v0_frames;
-				if (frames % 500 == 0)
-					eDebug("[histb-dec] v0 stats: %u presented, %u dropped (flip-sync)",
-						frames, m_v0_dropped.load());
+				else
+				{
+					/* idx is on screen now; the previously displayed
+					 * buffer left scanout at this flip and may be
+					 * rewritten by the decoder */
+					int prev = m_v0_onscreen;
+					m_v0_onscreen = idx;
+					if (prev >= 0)
+						m_v0_free[prev] = 1;
+					V0Buf &b = m_v0_buf[idx];
+					if (!m_v0_presented)
+					{
+						m_v0_presented = true;
+						eDebug("[histb-dec] first V0 frame presented %dx%d -> %dx%d",
+							b.w, b.h, m_width, m_height);
+					}
+					unsigned frames = ++m_v0_frames;
+					if (frames % 500 == 0)
+						eDebug("[histb-dec] v0 stats: %u presented, %u dropped (flip-sync)",
+							frames, m_v0_dropped.load());
+				}
 			}
 			else
-				m_v0_free[idx] = 1;
+			{
+				if (prime)
+					releasePrimeItem(pit);
+				else
+					m_v0_free[idx] = 1;
+			}
 		}
 	}
 
@@ -2066,13 +2128,27 @@ private:
 	std::mutex m_present_mutex;
 	std::condition_variable m_present_cv;
 	std::deque<int> m_present_queue;
+	/* decoded PRIME fbs staged for the present thread (see tryDirectV0);
+	 * each item pins one AVFrame so its capture buffer stays alive
+	 * while the fb sits in the queue or on screen */
+	struct PrimeItem
+	{
+		uint32_t fb = 0;
+		uint32_t handles[4] = {0, 0, 0, 0};
+		int nh = 0;
+		int64_t pts = AV_NOPTS_VALUE;
+		int w = 0, h = 0;
+		AVFrame *held = nullptr;
+	};
+	enum { kPrimeQueueMax = 12 }; /* ~480 ms of burst absorption at 25 fps */
+	std::deque<PrimeItem> m_prime_queue;
+	PrimeItem m_prime_onscreen; /* fb==0: nothing on screen */
 	int m_v0_onscreen = -1;
 	std::atomic<bool> m_flip_done{false};
 	std::atomic<bool> m_present_busy{false};
 	std::atomic<bool> m_present_stop{false};
 	bool m_present_running = false;
-	/* frame-paced presentation state (see paceToSlot) */
-	std::mutex m_pacer_mutex;
+	/* frame-paced presentation state (advanced only by presentThread) */
 	std::chrono::steady_clock::time_point m_pacer_slot{};
 	int64_t m_last_presented_pts = AV_NOPTS_VALUE;
 	double m_frame_period_us = 40000.0;
@@ -2784,7 +2860,7 @@ private:
 			return;
 		}
 		AVDRMFrameDescriptor *desc = (AVDRMFrameDescriptor *)f->data[0];
-		m_drm.showFrame(desc, f->width, f->height, f->pts);
+		m_drm.showFrame(desc, f->width, f->height, f->pts, f);
 	}
 
 	ePtr<eDVBDemux> m_demux;
