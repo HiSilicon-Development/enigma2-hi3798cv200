@@ -72,12 +72,22 @@ inline uint32_t histbDrmProperty(int fd, uint32_t object, uint32_t type,
 	return id;
 }
 
-/* Caller holds session.mutex. The fd stays alive until process exit so mode
- * ownership is not lost on channel change or while the decoder is stopped. */
-inline int histbDrmOpen()
+/* Caller holds session.mutex. Only connected HDMI acquires a persistent
+ * master; a disconnected probe must leave kernel hotplug ownership alone. */
+inline int histbDrmOpen(drmModeConnection *connection = nullptr)
 {
 	auto &s = histbDrmSession();
-	if (s.fd >= 0) return s.fd;
+	if (connection) *connection = DRM_MODE_UNKNOWNCONNECTION;
+	if (s.fd >= 0)
+	{
+		if (connection)
+		{
+			drmModeConnectorPtr connector = drmModeGetConnector(s.fd, s.connector);
+			if (connector) { *connection = connector->connection; drmModeFreeConnector(connector); }
+		}
+		return s.fd;
+	}
+	bool disconnected = false, otherConnection = false;
 	for (int card = 0; card < 8; ++card)
 	{
 		char path[32];
@@ -89,8 +99,13 @@ inline int histbDrmOpen()
 		for (int i = 0; i < res->count_connectors; ++i)
 		{
 			drmModeConnectorPtr c = drmModeGetConnector(fd, res->connectors[i]);
-			if (!c) continue;
+			if (!c) { otherConnection = true; continue; }
 			bool hdmi = c->connector_type == DRM_MODE_CONNECTOR_HDMIA || c->connector_type == DRM_MODE_CONNECTOR_HDMIB;
+			if (hdmi)
+			{
+				disconnected |= c->connection == DRM_MODE_DISCONNECTED;
+				otherConnection |= c->connection != DRM_MODE_DISCONNECTED;
+			}
 			if (hdmi && c->connection == DRM_MODE_CONNECTED && c->count_modes && res->count_crtcs)
 			{
 				uint32_t crtc = 0;
@@ -103,6 +118,7 @@ inline int histbDrmOpen()
 					(drmIsMaster(fd) || drmSetMaster(fd) == 0))
 				{
 					s.fd = fd; s.connector = c->connector_id; s.crtc = crtc;
+					if (connection) *connection = DRM_MODE_CONNECTED;
 					drmModeFreeConnector(c); drmModeFreeResources(res);
 					return fd;
 				}
@@ -112,6 +128,7 @@ inline int histbDrmOpen()
 		drmModeFreeResources(res);
 		close(fd);
 	}
+	if (connection && disconnected && !otherConnection) *connection = DRM_MODE_DISCONNECTED;
 	return -1;
 }
 
@@ -282,11 +299,21 @@ inline bool histbDrmSetMode(const drmModeModeInfo &mode)
 	return ok;
 }
 
+/* The caller validates the real fbdev backing before accepting a canvas.
+ * No HDMI sink defers presentation only; connected commit errors still fail. */
 inline bool histbOsdSetGeometry(uint32_t width, uint32_t height)
 {
 	auto &s = histbDrmSession();
 	std::lock_guard<std::mutex> lock(s.mutex);
-	if (histbDrmOpen() < 0) return false;
+	drmModeConnection connection;
+	int fd = histbDrmOpen(&connection);
+	if (connection == DRM_MODE_DISCONNECTED)
+	{
+		s.sourceW = width; s.sourceH = height;
+		eDebug("[histb-drm] HDMI disconnected; framebuffer canvas %ux%u remains available without an active output", width, height);
+		return true;
+	}
+	if (fd < 0 || connection != DRM_MODE_CONNECTED) return false;
 	drmModeCrtcPtr crtc = drmModeGetCrtc(s.fd, s.crtc);
 	if (!crtc || !crtc->mode_valid) { if (crtc) drmModeFreeCrtc(crtc); return false; }
 	uint32_t oldW = s.sourceW, oldH = s.sourceH;
