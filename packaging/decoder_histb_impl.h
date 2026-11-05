@@ -1595,6 +1595,22 @@ private:
 		return ok;
 	}
 
+	/* decoded PRIME fbs staged for the present thread (see tryDirectV0);
+	 * each item pins one AVFrame so its capture buffer stays alive
+	 * while the fb sits in the queue or on screen */
+	struct PrimeItem
+	{
+		uint32_t fb = 0;
+		uint32_t handles[4] = {0, 0, 0, 0};
+		int nh = 0;
+		int64_t pts = AV_NOPTS_VALUE;
+		int w = 0, h = 0;
+		AVFrame *held = nullptr;
+	};
+	enum { kPrimeQueueMax = 12 }; /* ~480 ms of burst absorption at 25 fps */
+	std::deque<PrimeItem> m_prime_queue;
+	PrimeItem m_prime_onscreen; /* fb==0: nothing on screen */
+
 	/* present-thread side: release a staged or retired PRIME item */
 	void releasePrimeItem(PrimeItem &it)
 	{
@@ -2128,21 +2144,6 @@ private:
 	std::mutex m_present_mutex;
 	std::condition_variable m_present_cv;
 	std::deque<int> m_present_queue;
-	/* decoded PRIME fbs staged for the present thread (see tryDirectV0);
-	 * each item pins one AVFrame so its capture buffer stays alive
-	 * while the fb sits in the queue or on screen */
-	struct PrimeItem
-	{
-		uint32_t fb = 0;
-		uint32_t handles[4] = {0, 0, 0, 0};
-		int nh = 0;
-		int64_t pts = AV_NOPTS_VALUE;
-		int w = 0, h = 0;
-		AVFrame *held = nullptr;
-	};
-	enum { kPrimeQueueMax = 12 }; /* ~480 ms of burst absorption at 25 fps */
-	std::deque<PrimeItem> m_prime_queue;
-	PrimeItem m_prime_onscreen; /* fb==0: nothing on screen */
 	int m_v0_onscreen = -1;
 	std::atomic<bool> m_flip_done{false};
 	std::atomic<bool> m_present_busy{false};
