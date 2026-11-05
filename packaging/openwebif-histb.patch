@@ -1,0 +1,481 @@
+diff --git a/plugin/controllers/i18n.py b/plugin/controllers/i18n.py
+index 514113e7..30b0893c 100644
+--- a/plugin/controllers/i18n.py
++++ b/plugin/controllers/i18n.py
+@@ -199,6 +199,7 @@ tstrings = {
+ 	'satfinder': _("Satfinder"),
+ 	'save': _("Save"),
+ 	'screenshot': _("Screenshot"),
++	'screenshot_unavailable': _("Screenshot capture failed. Select OSD to capture menus without video, or retry after playback starts."),
+ 	'search': _("Search"),
+ 	'search_csfd': _("Search CSFD"),
+ 	'search_imdb': _("Search IMDb"),
+diff --git a/plugin/controllers/models/config.py b/plugin/controllers/models/config.py
+index 6ba7c445..610275f0 100644
+--- a/plugin/controllers/models/config.py
++++ b/plugin/controllers/models/config.py
+@@ -26,8 +26,8 @@ from time import time
+ from xml.etree.ElementTree import parse
+ 
+ from enigma import eEnv
+-from Components.SystemInfo import BoxInfo, SystemInfo
+-from Components.config import config, ConfigBoolean
++from Components.SystemInfo import BoxInfo
++from Components.config import config, configfile, ConfigBoolean
+ 
+ try:
+ 	from Components.config import setupOnSave  # Get setupOnSave if available otherwise fallback to empty dict
+@@ -176,6 +176,19 @@ def getJsonFromConfig(cnf):
+ 	}
+ 
+ 
++def _persistConfig(elements):
++	saved = [(element, element.saved_value, element.loadValue) for element in elements]
++	try:
++		for element in elements:
++			element.save()
++		configfile.save()
++	except Exception:
++		for element, savedValue, loadValue in saved:
++			element.saved_value = savedValue
++			element.loadValue = loadValue
++		raise
++
++
+ def saveConfig(path, value, save):
+ 	oldValue = None
+ 	try:
+@@ -221,7 +234,7 @@ def saveConfig(path, value, save):
+ 		else:
+ 			cnf.value = value
+ 		if save:
+-			cnf.save()
++			_persistConfig([cnf])
+ 		configfiles.reload()
+ 	except Exception as e:
+ 		print(f"[OpenWebif] saveConfig Error : {e}")
+@@ -283,6 +296,7 @@ def saveConfigBatch(keys, section):
+ 		}
+ 
+ 	errors = []
++	elements = []
+ 	successful = 0
+ 
+ 	for path in keys:
+@@ -293,30 +307,39 @@ def saveConfigBatch(keys, section):
+ 			errors.append(f"Config '{path}' not found")
+ 			continue
+ 
++		elements.append(cnf)
++
++	if elements:
+ 		try:
+-			cnf.save()
+-			successful += 1
+-		except Exception as e:
+-			print(f"[OpenWebif] saveConfigBatch Error for {path}: {e}")
+-			errors.append(f"Error saving '{path}': {str(e)}")
++			_persistConfig(elements)
++			successful = len(elements)
++		except Exception as error:
++			print(f"[OpenWebif] saveConfigBatch persistence error: {error}")
++			errors.append(f"Error saving configuration: {error}")
+ 
+ 	try:
+ 		configfiles.reloadSection(section)
+ 	except Exception as e:
+ 		print(f"[OpenWebif] saveConfigBatch reload error: {e}")
+ 		errors.append("Error reloading configuration")
++	applied = None
+ 
+-	if section in setupOnSave:
++	if successful and section in setupOnSave:
+ 		try:
+ 			callback = setupOnSave.get(section)
+ 			if callback and callable(callback):
+ 				callback()
++				applied = True
+ 		except Exception as e:
+ 			print(f"[OpenWebif] saveConfigBatch callback error for section '{section}': {e}")
++			applied = False
++			errors.append("Configuration was saved but its setup callback failed")
+ 
+ 	return {
+ 		"result": successful > 0 and len(errors) == 0,
+ 		"successful": successful,
++		"saved": successful > 0,
++		"setup_callback_completed": applied,
+ 		"total": len(keys),
+ 		"errors": errors if errors else []
+ 	}
+@@ -498,7 +521,7 @@ class ConfigFiles:
+ 					except Exception:
+ 						return False
+ 				else:
+-					result = SystemInfo.get(requires, False)
++					result = bool(BoxInfo.getItem(require, False))
+ 				if require and negate == result:  # The item requirements are not met.
+ 					return False
+ 		conditional = element.get("conditional")
+diff --git a/plugin/controllers/models/control.py b/plugin/controllers/models/control.py
+index a9bbfb88..d13382b4 100644
+--- a/plugin/controllers/models/control.py
++++ b/plugin/controllers/models/control.py
+@@ -205,7 +205,16 @@ def remoteControl(key, rctype="", rcu=DEFAULT_RCU):
+ 
+ def setPowerState(session, state):
+ 	from Screens.Standby import Standby, TryQuitMainloop, inStandby
+-	state = int(state)
++	try:
++		state = int(state)
++	except (TypeError, ValueError):
++		return {"result": False, "message": "Invalid power action", "instandby": inStandby is not None}
++	if state not in (0, 1, 2, 3, 4, 5):
++		return {"result": False, "message": "Unsupported power action", "instandby": inStandby is not None}
++	opens_dialog = state in (1, 2, 3) or (state in (0, 5) and inStandby is None)
++	# Match Session.open's invariant; never force modal state during crash cleanup.
++	if opens_dialog and session.dialog_stack and not session.in_exec:
++		return {"result": False, "message": "Receiver UI is busy; power action was not applied", "instandby": inStandby is not None}
+ 	if state == 0:  # Toggle StandBy
+ 		if inStandby is None:
+ 			session.open(Standby)
+@@ -224,9 +233,8 @@ def setPowerState(session, state):
+ 		if inStandby is None:
+ 			session.open(Standby)
+ 
+-	elif state == 6:
+-		print("HAHA")
+ 
++	from Screens.Standby import inStandby
+ 	return {
+ 		"result": True,
+ 		"instandby": inStandby is not None
+diff --git a/plugin/controllers/models/grab.py b/plugin/controllers/models/grab.py
+index 4e0aea91..4f2a0ef5 100644
+--- a/plugin/controllers/models/grab.py
++++ b/plugin/controllers/models/grab.py
+@@ -1,123 +1,176 @@
+ ##########################################################################
+ # OpenWebif: grab
+-##########################################################################
+ # Copyright (C) 2011 - 2023 E2OpenPlugins, jbleyel
+-#
+-# This program is free software; you can redistribute it and/or modify it
+-# under the terms of the GNU General Public License as published by
+-# the Free Software Foundation; either version 3 of the License, or
+-# (at your option) any later version.
+-#
+-# This program is distributed in the hope that it will be useful,
+-# but WITHOUT ANY WARRANTY; without even the implied warranty of
+-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+-# GNU General Public License for more details.
+-#
+-# You should have received a copy of the GNU General Public License
+-# along with this program; if not, write to the Free Software Foundation,
+-# Inc., 51 Franklin Street, Fifth Floor, Boston MA 02110-1301, USA.
++# SPDX-License-Identifier: GPL-3.0-or-later
+ ##########################################################################
+ 
+-from time import localtime, strftime, time
++from os import access, X_OK
++from tempfile import SpooledTemporaryFile
++from time import localtime, strftime
++from twisted.internet import reactor
+ from twisted.web import resource, server
+ from enigma import eConsoleAppContainer, eDBoxLCD
+ from Components.config import config
+-from Screens.InfoBar import InfoBar
+ from ServiceReference import ServiceReference
+ from ..utilities import getUrlArg
+ 
+ GRAB_PATH = "/usr/bin/grab"
++HISTB_GRAB_PATH = "/usr/local/bin/histb-screenshot"
++MAX_IMAGE_BYTES = 64 * 1024 * 1024
+ 
+ 
+ class GrabRequest:
+-	def __init__(self, request, session):
++	def __init__(self, request, session, owner):
+ 		self.request = request
+-
+-		mode = None
+-		graboptions = [GRAB_PATH, "-q", "-s"]
+-
+-		fileformat = getUrlArg(request, "format", "jpg")
+-		if fileformat == "jpg":
+-			graboptions.append("-j")
+-			graboptions.append("95")
+-		elif fileformat == "png":
+-			graboptions.append("-p")
+-		elif fileformat != "bmp":
+-			fileformat = "bmp"
+-
++		self.owner = owner
++		owner.active = self
++		self.container = eConsoleAppContainer()
++		self.output = SpooledTemporaryFile(max_size=1024 * 1024)
++		self.size = 0
++		self.error = None
++		self.finished = False
++		self.timer = None
++		self.fileformat = getUrlArg(request, "format", "jpg")
++		mode = getUrlArg(request, "mode", "all")
++		if self.fileformat not in ("jpg", "png", "bmp") or mode not in ("all", "osd", "video", "pip", "lcd"):
++			self.fail(400, "Unsupported screenshot format or mode")
++			return
+ 		size = getUrlArg(request, "r")
+-		if size is not None:
+-			graboptions.append("-r")
+-			graboptions.append(f"{int(size)}")
++		try:
++			width = int(size) if size is not None else 0
++		except (TypeError, ValueError):
++			self.fail(400, "Invalid screenshot width")
++			return
++		if size is not None and not 64 <= width <= 4096:
++			self.fail(400, "Screenshot width must be between 64 and 4096")
++			return
+ 
+-		mode = getUrlArg(request, "mode")
+-		if mode is not None:
++		native = access(HISTB_GRAB_PATH, X_OK)
++		if native:
++			if mode in ("pip", "lcd"):
++				self.fail(501, "This HiSTB display has no capture backend for the requested mode")
++				return
++			program = HISTB_GRAB_PATH
++			options = [program, "--format", self.fileformat, "--mode", mode]
++			if width:
++				options += ["--width", str(width)]
++		else:
++			program = GRAB_PATH
++			options = [program, "-q", "-s"]
++			if self.fileformat == "jpg":
++				options += ["-j", "95"]
++			elif self.fileformat == "png":
++				options.append("-p")
++			if width:
++				options += ["-r", str(width)]
+ 			if mode == "osd":
+-				graboptions.append("-o")
+-			elif mode == "video":
+-				graboptions.append("-v")
+-			elif mode == "pip":
+-				graboptions.append("-v")
+-				if InfoBar.instance.session.pipshown:
+-					graboptions.append("-i 1")
++				options.append("-o")
++			elif mode in ("video", "pip"):
++				options.append("-v")
++				if mode == "pip":
++					if not session.pipshown:
++						self.fail(409, "Picture in picture is not active")
++						return
++					options += ["-i", "1"]
+ 			elif mode == "lcd":
+ 				eDBoxLCD.getInstance().setDump(True)
+-				fileformat = "png"
+-				command = "cat /tmp/lcd.png"
++				self.fileformat = "png"
++				program = "/bin/cat"
++				options = [program, "/tmp/lcd.png"]
+ 
+-		self.filepath = f"/tmp/screenshot.{fileformat}"
+-		self.container = eConsoleAppContainer()
++		sref = "screenshot"
++		ref = session.nav.getCurrentlyPlayingServiceReference()
++		if ref is not None:
++			sref = "_".join(ref.toString().split(":", 10)[:10])
++			if config.OpenWebif.webcache.screenshotchannelname.value:
++				sref = ServiceReference(ref).getServiceName()
++		# A service name is untrusted header data, not an HTTP filename.
++		sref = "".join(c if c.isalnum() or c in "_-" else "_" for c in sref)
++		self.filename = f"{sref}_{strftime('%Y%m%d%H%M%S', localtime())}.{self.fileformat}"
+ 		self.container.appClosed.append(self.grabFinished)
+-		self.container.stdoutAvail.append(request.write)
++		self.container.stdoutAvail.append(self.dataReceived)
+ 		self.container.setBufferSize(32768)
+-		if mode == "lcd":
+-			if self.container.execute(command):
+-				raise Exception("failed to execute: ", command)
+-			sref = "lcdshot"
+-		else:
+-			self.container.execute(GRAB_PATH, *graboptions)
+-			try:
+-				if mode == "pip" and InfoBar.instance.session.pipshown:
+-					ref = InfoBar.instance.session.pip.getCurrentService().toString()
+-				else:
+-					ref = session.nav.getCurrentlyPlayingServiceReference().toString()
+-				sref = "_".join(ref.split(":", 10)[:10])
+-				if config.OpenWebif.webcache.screenshotchannelname.value:
+-					sref = ServiceReference(ref).getServiceName()
+-			except Exception:  # nosec # noqa: E722
+-				sref = "screenshot"
+-		sref = f"{sref}_{strftime('%Y%m%d%H%M%S', localtime(time()))}"
+ 		request.notifyFinish().addErrback(self.requestAborted)
+-		request.setHeader('Content-Disposition', f'inline; filename={sref}.{fileformat};')
+-		request.setHeader('Content-Type', f"image/{fileformat.replace('jpg', 'jpeg')}")
+-		# request.setHeader('Expires', 'Sat, 26 Jul 1997 05:00:00 GMT')
+-		# request.setHeader('Cache-Control', 'no-store, must-revalidate, post-check=0, pre-check=0')
+-		# request.setHeader('Pragma', 'no-cache')
++		self.timer = reactor.callLater(15, self.captureTimeout)
++		if self.container.execute(program, *options):
++			self.fail(503, "Screenshot backend could not be started")
+ 
+-	def requestAborted(self, err):
+-		# Called when client disconnected early, abort the process and
+-		# don't call request.finish()
+-		del self.container.appClosed[:]
++	def dataReceived(self, data):
++		if self.finished:
++			return
++		self.size += len(data)
++		if self.size > MAX_IMAGE_BYTES:
++			self.error = "Screenshot exceeded the capture size limit"
++			self.container.kill()
++		else:
++			self.output.write(data)
++
++	def captureTimeout(self):
++		self.timer = None
++		self.error = "Screenshot backend timed out"
+ 		self.container.kill()
+-		del self.request
+-		del self.container
+ 
+-	def grabFinished(self, retval=None):
+-		try:
+-			self.request.finish()
+-		except RuntimeError as error:
+-			print(f"[OpenWebif] grabFinished error: {error}")
+-		# Break the chain of ownership
+-		del self.request
++	def cleanup(self):
++		self.finished = True
++		if self.timer is not None and self.timer.active():
++			self.timer.cancel()
++		del self.container.appClosed[:]
++		del self.container.stdoutAvail[:]
++		self.output.close()
++		self.owner.active = None
++
++	def requestAborted(self, error):
++		if not self.finished:
++			self.container.kill()
++			self.cleanup()
++		return None
++
++	def fail(self, code, message):
++		if self.finished:
++			return
++		self.request.setResponseCode(code)
++		self.request.setHeader("Content-Type", "text/plain; charset=utf-8")
++		self.request.setHeader("Cache-Control", "no-store")
++		self.request.write((message + "\n").encode("UTF-8"))
++		self.cleanup()
++		self.request.finish()
++
++	def grabFinished(self, retval):
++		if self.finished:
++			return
++		self.output.seek(0)
++		header = self.output.read(8)
++		valid = ((self.fileformat == "jpg" and header.startswith(b"\xff\xd8\xff")) or
++			(self.fileformat == "png" and header == b"\x89PNG\r\n\x1a\n") or
++			(self.fileformat == "bmp" and header.startswith(b"BM")))
++		if retval or self.error or not valid:
++			self.fail(503, self.error or f"Screenshot backend failed (exit {retval}, {self.size} bytes)")
++			return
++		self.request.setHeader("Content-Type", "image/" + self.fileformat.replace("jpg", "jpeg"))
++		self.request.setHeader("Content-Disposition", f'inline; filename="{self.filename}"')
++		self.request.setHeader("Content-Length", str(self.size))
++		self.request.setHeader("Cache-Control", "no-store")
++		self.output.seek(0)
++		while True:
++			chunk = self.output.read(32768)
++			if not chunk:
++				break
++			self.request.write(chunk)
++		self.cleanup()
++		self.request.finish()
+ 
+ 
+ class GrabScreenshot(resource.Resource):
+ 	def __init__(self, session, path=None):
+ 		resource.Resource.__init__(self)
+ 		self.session = session
++		self.active = None
+ 
+ 	def render(self, request):
+-		# Add a reference to the grabber to the Request object. This keeps
+-		# the object alive at least until the request finishes
+-		request.grab_in_progress = GrabRequest(request, self.session)
++		if self.active is not None:
++			request.setResponseCode(409)
++			request.setHeader("Content-Type", "text/plain; charset=utf-8")
++			return b"A screenshot capture is already in progress\n"
++		# Keep ownership until completion or client disconnect, not just render().
++		GrabRequest(request, self.session, self)
+ 		return server.NOT_DONE_YET
+diff --git a/plugin/controllers/models/services.py b/plugin/controllers/models/services.py
+index 2a96be42..dbce6c6c 100644
+--- a/plugin/controllers/models/services.py
++++ b/plugin/controllers/models/services.py
+@@ -22,6 +22,7 @@ from datetime import datetime
+ from collections import OrderedDict
+ from re import search, sub, IGNORECASE
+ from os.path import isfile, join as pathjoin
++from os import access, X_OK
+ from urllib.parse import quote, unquote
+ from time import time, localtime, strftime, mktime
+ from unicodedata import normalize
+@@ -87,6 +88,12 @@ def getCurrentService(session):
+ 		except:  # nosec # noqa: E722
+ 			pass
+ 
++		# Decoder source cadence is independent of the current HDMI output timing.
++		source_rate = info.getInfo(iServiceInformation.sFrameRate)
++		hdmi_mode = None
++		if access("/usr/local/bin/histb-screenshot", X_OK):
++			from enigma import eAVControl
++			hdmi_mode = eAVControl.getInstance().getVideoMode()
+ 		return {
+ 			"result": True,
+ 			"name": filterName(info.getName()),
+@@ -95,6 +102,8 @@ def getCurrentService(session):
+ 			"provider": getServiceInfoString(info, iServiceInformation.sProvider),
+ 			"width": getServiceInfoString(info, iServiceInformation.sVideoWidth),
+ 			"height": getServiceInfoString(info, iServiceInformation.sVideoHeight),
++			"source_fps": source_rate / 1000.0 if source_rate > 0 else None,
++			"hdmi_mode": hdmi_mode,
+ 			"apid": getServiceInfoString(info, iServiceInformation.sAudioPID),
+ 			"vpid": getServiceInfoString(info, iServiceInformation.sVideoPID),
+ 			"pcrpid": getServiceInfoString(info, iServiceInformation.sPCRPID),
+diff --git a/plugin/controllers/views/ajax/screenshot.tmpl b/plugin/controllers/views/ajax/screenshot.tmpl
+index abfadf6e..03f787ce 100644
+--- a/plugin/controllers/views/ajax/screenshot.tmpl
++++ b/plugin/controllers/views/ajax/screenshot.tmpl
+@@ -16,7 +16,8 @@
+ 		</div>
+ 		<div class="screenshotContainer">
+ 			<div id="screenshotImageContainer" style="resize: both;overflow: auto;min-height:480px;min-width:720px">
+-				<img id="screenshotimage" src="" alt="$tstrings['loading'] ..." width="100%">
++				<img id="screenshotimage" src="" alt="$tstrings['loading'] ..." width="100%" onload="this.style.display='';jQuery('#screenshoterror').hide();" onerror="this.style.display='none';jQuery('#screenshotspinner').hide();jQuery('#screenshoterror').show();">
++				<p id="screenshoterror" role="status" style="display:none">$tstrings['screenshot_unavailable']</p>
+ 				<div id="screenshotspinnerl" style="top: 50%;left: 50%;margin-left: 50px;margin-top: 50px;;position:absolute;font-size:50px">
+ 					<div id="screenshotspinner" class='fa fa-spin' style="display: none;"></div>
+ 				</div>
+diff --git a/plugin/controllers/views/responsive/ajax/screenshot.tmpl b/plugin/controllers/views/responsive/ajax/screenshot.tmpl
+index 2d53673a..edcd8109 100644
+--- a/plugin/controllers/views/responsive/ajax/screenshot.tmpl
++++ b/plugin/controllers/views/responsive/ajax/screenshot.tmpl
+@@ -28,7 +28,8 @@
+ 
+ 		<div class="body">
+ 			<div class="row clearfix">
+-				<img src="" id="screenshotimage" class="img-fluid rounded" alt="$tstrings['loading'] ...">
++				<img src="" id="screenshotimage" class="img-fluid rounded" alt="$tstrings['loading'] ..." onload="this.style.display='';jQuery('#screenshoterror').hide();" onerror="this.style.display='none';jQuery('#responsivespinnerscreenshot').hide();jQuery('#screenshoterror').show();">
++				<p id="screenshoterror" role="status" style="display:none">$tstrings['screenshot_unavailable']</p>
+ 			</div>
+ 			<div class="row clearfix m-t-20">
+ 				<div class="col-xs-12 col-sm-7 align-right">

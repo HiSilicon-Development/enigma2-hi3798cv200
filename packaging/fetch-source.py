@@ -31,7 +31,7 @@ SOURCES = {
     "weatherinfo": ("openatv/WeatherInfo", "HEAD"),
     "oe-alliance-core": ("oe-alliance/oe-alliance-core", "master"),
     "metrixhd": ("openatv/MetrixHD", "HEAD"),
-    "openwebif": ("oe-alliance/OpenWebif", "HEAD"),
+    "openwebif": ("oe-alliance/OpenWebif", "b511d277098de5e0f0a16a2cd4e55510874e19df"),
 }
 
 
