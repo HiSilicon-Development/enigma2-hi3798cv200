@@ -2,7 +2,6 @@
 #ifndef E2_HISTB_AUDIO_CONTROL_H
 #define E2_HISTB_AUDIO_CONTROL_H
 #include <atomic>
-#include <cmath>
 #include <cstdint>
 #include <cstring>
 
@@ -24,9 +23,9 @@ inline uint32_t histbPcmGain(int volume)
 {
 	if (volume <= 0) return 0;
 	if (volume >= 100) return 65536;
-	/* Match eDVBVolumecontrol's existing 0..63 one-dB attenuation steps. */
-	int attenuation = 63 - volume * 63 / 100;
-	return uint32_t(std::lround(std::pow(10.0, -attenuation / 20.0) * 65536.0));
+	/* HISTB replaces the ALSA percentage control on a raw HDMI PCM;
+	 * the legacy DVB mixer's one-dB attenuation steps do not apply. */
+	return uint32_t(volume) * 65536 / 100;
 }
 
 inline void histbSetPcmVolume(int left, int right)
