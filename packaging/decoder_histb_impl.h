@@ -92,6 +92,7 @@ FF_SYM(int, av_packet_from_data, AVPacket *pkt, uint8_t *data, int size);
 FF_SYM(AVFrame *, av_frame_alloc, void);
 FF_SYM(void, av_frame_free, AVFrame **frame);
 FF_SYM(void, av_frame_unref, AVFrame *frame);
+FF_SYM(int, av_frame_ref, AVFrame *dst, const AVFrame *src);
 FF_SYM(AVBufferRef *, av_buffer_ref, AVBufferRef *buf);
 FF_SYM(void, av_buffer_unref, AVBufferRef **buf);
 FF_SYM(int, av_hwdevice_ctx_create, AVBufferRef **device_ref, enum AVHWDeviceType type, const char *device, AVDictionary *opts, int flags);
@@ -126,6 +127,7 @@ FF_SYM(void, sws_freeContext, struct SwsContext *ctx);
 #define av_frame_alloc av_frame_alloc_ptr
 #define av_frame_free av_frame_free_ptr
 #define av_frame_unref av_frame_unref_ptr
+#define av_frame_ref av_frame_ref_ptr
 #define av_buffer_ref av_buffer_ref_ptr
 #define av_buffer_unref av_buffer_unref_ptr
 #define av_hwdevice_ctx_create av_hwdevice_ctx_create_ptr
@@ -227,6 +229,7 @@ static bool histb_ff_load()
 	FF_BIND(av_frame_alloc);
 	FF_BIND(av_frame_free);
 	FF_BIND(av_frame_unref);
+	FF_BIND(av_frame_ref);
 	FF_BIND(av_buffer_ref);
 	FF_BIND(av_buffer_unref);
 	FF_BIND(av_hwdevice_ctx_create);
