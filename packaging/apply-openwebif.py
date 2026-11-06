@@ -2,8 +2,9 @@
 """Apply the maintained HiSTB OpenWebif patch to its complete source tree.
 
 Usage: python3 packaging/apply-openwebif.py PATH_TO_OPENWEBIF_SOURCE
-Upstream base: oe-alliance/OpenWebif b511d277098de5e0f0a16a2cd4e55510874e19df.
-Run after fetching the pinned source, before rebuilding desktop/mobile assets.
+Observed upstream reference: oe-alliance/OpenWebif main
+7a7bb63ba166ccf6623706eba019584231840a6d (2026-11-06), not a fetch-policy pin.
+Run after fetching upstream source, before rebuilding desktop/mobile assets.
 This does not edit device authentication, user settings or skins.
 The separate histb-screenshot.cpp helper is built for the target, not executed
 by this script. It requires the matching Enigma2 native-frame lease service.
@@ -12,7 +13,7 @@ from pathlib import Path
 import subprocess
 import sys
 
-SOURCE_COMMIT = "b511d277098de5e0f0a16a2cd4e55510874e19df"
+SOURCE_COMMIT = "7a7bb63ba166ccf6623706eba019584231840a6d"
 
 
 def main():

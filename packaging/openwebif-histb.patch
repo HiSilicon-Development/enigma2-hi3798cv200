@@ -1,3 +1,15 @@
+diff --git a/CHANGES.md b/CHANGES.md
+index 498c829d..66a8b053 100644
+--- a/CHANGES.md
++++ b/CHANGES.md
+@@ -1,4 +1,7 @@
+ ## Version 2.4.1
++* route time-source batch save/cancel through the upstream DateTime setup key, retaining backend failure reporting and cancellation restoration
++* serialize classic screenshots, cancel captures when leaving the page, and show actual HTTP/backend failures instead of a blank image
++* explain the separate OSCam/NCam Webinterface login beside the classic external entry without changing authentication
+ * add keyboard remote control to the screenshot screen (0-9, cursor keys, esc, enter, space, r/g/y/b) with a short key overlay
+ * add allservicescsvalphabetical API (services sorted by name with SID/TSID and orbital position)
+ * add DAB support
 diff --git a/locale/OpenWebif.pot b/locale/OpenWebif.pot
 index da8851f4..13fb7f2e 100644
 --- a/locale/OpenWebif.pot
@@ -269,7 +281,7 @@ index 1e504555..53f19bd6 100644
  		self.json = False
  		self.container = None
 diff --git a/plugin/controllers/models/config.py b/plugin/controllers/models/config.py
-index 6ba7c445..827bb00a 100644
+index 6ba7c445..8e10c687 100644
 --- a/plugin/controllers/models/config.py
 +++ b/plugin/controllers/models/config.py
 @@ -24,10 +24,11 @@ from os import listdir
@@ -992,7 +1004,7 @@ index 4e0aea91..b4d6d8cd 100644
 +		GrabRequest(request, self.session, self)
  		return server.NOT_DONE_YET
 diff --git a/plugin/controllers/models/info.py b/plugin/controllers/models/info.py
-index 01923eda..bda81aa7 100644
+index 1b38448a..f224eabf 100644
 --- a/plugin/controllers/models/info.py
 +++ b/plugin/controllers/models/info.py
 @@ -25,12 +25,12 @@ from twisted import version
@@ -1050,7 +1062,7 @@ index 01923eda..bda81aa7 100644
  	if exists("/etc/.box"):
  		f = open("/etc/.box")
  		model = f.readline().strip().lower()
-@@ -413,14 +419,14 @@ def getInfo(session=None, need_fullinfo=False):
+@@ -415,14 +421,14 @@ def getInfo(session=None, need_fullinfo=False):
  	info["webifver"] = OPENWEBIFVER
  	info["imagedistro"] = BoxInfo.getItem("distro")
  	info["friendlyimagedistro"] = BoxInfo.getItem("displaydistro")
@@ -1069,7 +1081,7 @@ index 01923eda..bda81aa7 100644
  
  	try:
  		from Tools.StbHardware import getFPVersion
-@@ -473,19 +479,22 @@ def getInfo(session=None, need_fullinfo=False):
+@@ -475,19 +481,22 @@ def getInfo(session=None, need_fullinfo=False):
  		})
  
  	info["hdd"] = []
@@ -1101,7 +1113,7 @@ index 01923eda..bda81aa7 100644
  
  		size = hdd.diskSize() * 1000000 / 1048576.
  		if size > 1048576:
-@@ -518,7 +527,7 @@ def getInfo(session=None, need_fullinfo=False):
+@@ -520,7 +529,7 @@ def getInfo(session=None, need_fullinfo=False):
  			"capacity": size,
  			"labelled_capacity": iecsize,
  			"free": free,
