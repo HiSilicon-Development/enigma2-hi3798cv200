@@ -1,0 +1,17 @@
+diff --git a/lib/python/Screens/WizardVideo.py b/lib/python/Screens/WizardVideo.py
+index 01aaed2..11f5445 100644
+--- a/lib/python/Screens/WizardVideo.py
++++ b/lib/python/Screens/WizardVideo.py
+@@ -172,6 +172,12 @@ class WizardVideo(Wizard, ShowRemoteControl):
+ 			self.close()
+ 		Wizard.keyNumberGlobal(self, number)
+ 
++	def markDone(self):
++		# Exiting the wizard confirms completion without selecting a new mode.
++		config.misc.videowizardenabled.value = False
++		config.misc.videowizardenabled.save()
++		configfile.save()
++
+ 	def saveWizardChanges(self):  # Called by wizardvideo.xml.
+ 		avSwitch.saveMode(self.port, self.mode, self.rate)
+ 		# config.misc.wizardVideoEnabled.value = 0

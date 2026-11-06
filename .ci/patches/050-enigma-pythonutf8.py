@@ -11,11 +11,10 @@ new = (old
        + '\t// Force Python UTF-8 mode: host lacks glibc UTF-8 locales,\n'
          '\t// so open() would default to ascii and crash on UTF-8 data files.\n'
          '\tsetenv("PYTHONUTF8", "1", 1);\n')
-if 'PYTHONUTF8' in s:
+if s.count(new) == 1:
     print('enigma.cpp already patched')
-elif old in s:
+elif s.count(old) == 1:
     open(p, 'w').write(s.replace(old, new, 1))
     print('enigma.cpp PYTHONUTF8 patched')
 else:
     raise SystemExit('enigma.cpp anchor not found - upstream changed, review needed')
-

@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
-"""Apply all .ci/patches/*.py (lexical order) against the enigma2 checkout.
+"""Prepare an official Enigma2 checkout using .ci/patches/*.py in lexical order.
 
-Each patch script is a standalone python program executed with cwd=<checkout>.
-Scripts must be idempotent (skip when already applied) and must raise
-SystemExit when their anchor is missing - upstream drift means manual review,
-never a silent skip.
+010-150: Debian compatibility and shared native-KMS display installation.
+200: HiSTB decoder wiring and all companion headers.
+210: reject zero-frequency channel updates and omit them from both DB formats.
+220: apply packaging/patches/*.patch in lexical order.
+300: isolate unavailable vendor procfs paths, including newly installed sources.
+
+Each script runs with cwd=<checkout>. Use a fresh official checkout for this
+complete ordered transformation; overlapping maintained patches are not a
+repeatable overlay. Missing anchors and failed patches stop on upstream drift.
 """
 import glob
 import os

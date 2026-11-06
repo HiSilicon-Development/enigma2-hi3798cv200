@@ -16,4 +16,3 @@ elif 'len(fetched) < 3' in s:
 else:
     raise SystemExit('SoftwareUpdate.py anchor not found - upstream changed, review needed')
 print('SoftwareUpdate.py short-tuple guard patched')
-

@@ -7,16 +7,12 @@
 p = 'lib/python/Components/International.py'
 s = open(p).read()
 import re
-s2 = re.sub(r'\tDEFINED_LOCALES = \[.*?\]\n',
-            '\tDEFINED_LOCALES = ["en", "zh-cn", "zh-hk"]\n', s, count=1)
-s2 = re.sub(r'\tPERMANENT_LOCALES = \[.*?\]\n',
-            '\tPERMANENT_LOCALES = ["en_US"]\n', s2, count=1)
-if s2 == s:
-    if 'DEFINED_LOCALES = ["en", "zh-cn", "zh-hk"]' in s:
-        print('International.py already pruned')
-    else:
-        raise SystemExit('International.py anchors not found - upstream changed, review needed')
-else:
-    open(p, 'w').write(s2)
-    print('International.py DEFINED_LOCALES/PERMANENT_LOCALES pruned')
-
+for name, value in (('DEFINED_LOCALES', '["en", "zh-cn", "zh-hk"]'),
+                    ('PERMANENT_LOCALES', '["en_US"]')):
+    replacement = '\t' + name + ' = ' + value + '\n'
+    pattern = r'\t' + name + r' = \[.*?\]\n'
+    s, count = re.subn(pattern, replacement, s)
+    if count != 1:
+        raise SystemExit('International.py ' + name + ' anchor not unique - upstream changed, review needed')
+open(p, 'w').write(s)
+print('International.py DEFINED_LOCALES/PERMANENT_LOCALES pruned')

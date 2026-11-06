@@ -26,4 +26,3 @@ elif '(keep current mode)' in s:
     print('fb.cpp SetMode fallback already patched')
 else:
     raise SystemExit('fb.cpp anchor not found - upstream changed, review needed')
-

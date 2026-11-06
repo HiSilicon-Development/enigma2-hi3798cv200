@@ -112,4 +112,3 @@ else:
     raise SystemExit('dvb.cpp real frontend anchor not found - upstream changed, review needed')
 open(p, 'w').write(s)
 print('dvb.cpp mainline adapter registration patched')
-

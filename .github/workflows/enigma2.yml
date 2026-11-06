@@ -1,6 +1,6 @@
-name: enigma2-debian12-arm64
+name: enigma2-debian-arm64
 
-# openATV enigma2 (master) -> Debian 12 (bookworm) arm64，原生 arm64 runner 构建，产出 .deb
+# Native arm64 builds for Debian 12 (bundled Python) and Debian 13 (system Python).
 on:
   workflow_dispatch:
     inputs:
@@ -10,6 +10,9 @@ on:
       machinebuild:
         description: "enigma2 MACHINEBUILD (configure --with-machinebuild)"
         default: "u5"
+      source_refs:
+        description: 'JSON repository refs (branch, tag or commit); reuse sources.lock.json to pin a run'
+        default: '{}'
   push:
     paths:
       - ".github/workflows/enigma2.yml"
@@ -21,20 +24,25 @@ on:
 jobs:
   enigma2:
     runs-on: ubuntu-24.04-arm
-    container: debian:12
+    strategy:
+      fail-fast: false
+      matrix:
+        debian: ['12', '13']
+    container: debian:${{ matrix.debian }}
     timeout-minutes: 120
     env:
       DEBIAN_FRONTEND: noninteractive
       BOXTYPE: ${{ github.event.inputs.boxtype || 'u5' }}
       MACHINEBUILD: ${{ github.event.inputs.machinebuild || 'u5' }}
-      E2VER: 8.0.dvbip1002.${{ github.run_number }}
+      E2VER: 8.0.dvbip.${{ github.run_number }}~deb${{ matrix.debian }}
+      SOURCE_REFS: ${{ github.event.inputs.source_refs || '{}' }}
 
     steps:
-      - name: Install build deps (Debian 12)
+      - name: Install build deps (Debian ${{ matrix.debian }})
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
-            build-essential autoconf automake autoconf-archive libtool pkg-config \
+            build-essential dpkg-dev autoconf automake autoconf-archive libtool pkg-config \
             gettext bison flex swig git curl ca-certificates xz-utils \
             doxygen graphviz xsltproc \
             python3 python3-dev python3-setuptools \
@@ -44,13 +52,30 @@ jobs:
             libjpeg-dev libgif-dev libwebp-dev libswscale-dev \
             libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
             zlib1g-dev libbz2-dev libreadline-dev libsqlite3-dev libffi-dev \
-            liblzma-dev libncursesw5-dev uuid-dev \
-            libasound2-dev libdrm-dev
+            liblzma-dev libncurses-dev uuid-dev \
+            libasound2-dev libdrm-dev libsigc++-3.0-dev
+          if [ '${{ matrix.debian }}' = 13 ]; then
+            apt-get install -y --no-install-recommends \
+              python3-twisted python3-openssl python3-service-identity python3-idna \
+              python3-usb python3-cheetah python3-pil python3-requests
+          fi
+
+      # Checkout before creating any staging in the workspace: checkout cleans it.
+      - name: Checkout this repo (packaging files)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+
+      - name: Select locked WebUI asset build runtime
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
 
       # ---- Python 3.13：enigma2 master 已全面采用 PEP 701 f-string 语法（>300 处），
       #      Debian 12 的 python3.11 无法解析，必须自带新解释器 ----
-
-      - name: Build Python 3.13 (master requires PEP 701 syntax)
+      - name: Build Python 3.13 (Debian 12 only)
+        if: matrix.debian == '12'
         run: |
           PYVER=3.13.18
           curl -fsSL -o /tmp/py.tgz "https://www.python.org/ftp/python/${PYVER}/Python-${PYVER}.tgz"
@@ -63,19 +88,22 @@ jobs:
           ldconfig
           /usr/local/bin/python3.13 --version
 
-      # ---- Debian 12 缺失的依赖：源码补编 ----
-
-      - name: Build sigc++-3.x (not in bookworm)
+      - name: Select Python build configuration
         run: |
-          git clone --depth 1 --branch 3.2.0 https://github.com/libsigcplusplus/libsigcplusplus.git /tmp/sigc
-          cd /tmp/sigc
-          meson setup build --prefix=/usr -Dbuild-examples=false -Dbuild-documentation=false
-          ninja -C build install
-          ldconfig
+          if [ '${{ matrix.debian }}' = 13 ]; then
+            PYTHON=/usr/bin/python3
+          else
+            PYTHON=/usr/local/bin/python3.13
+          fi
+          echo "PYTHON=$PYTHON" >> "$GITHUB_ENV"
+          echo "PYTHON_CPPFLAGS=$($PYTHON-config --includes)" >> "$GITHUB_ENV"
+          echo "PYTHON_LIBS=$($PYTHON-config --embed --ldflags)" >> "$GITHUB_ENV"
+
+      # Libraries unavailable from Debian are staged after the workspace checkout.
 
       - name: Build libdvbsi++ (OpenVisionE2)
         run: |
-          git clone --depth 1 https://github.com/OpenVisionE2/libdvbsi.git /tmp/libdvbsi
+          python3 packaging/fetch-source.py clone libdvbsi /tmp/libdvbsi
           cd /tmp/libdvbsi
           ./autogen.sh
           ./configure --prefix=/usr
@@ -87,15 +115,15 @@ jobs:
       - name: Build libtuxtxt (OpenPLi, provides tuxbox-tuxtxt)
         run: |
           # openATV enigma2 配套的是 OE-A fork（提供 tuxtxt_enabledebug 等符号），非 OpenPLi 版
-          git clone --depth 1 https://github.com/oe-alliance/tuxtxt.git /tmp/tuxtxt
+          python3 packaging/fetch-source.py clone tuxtxt /tmp/tuxtxt
           cd /tmp/tuxtxt/libtuxtxt
           # libtuxtxt 需要 tuxbox-cvs 的头文件：libtuxbox/tuxbox.h + driver/include/tuxbox/*（header-only）
-          curl -fsSL -o /usr/include/tuxbox.h \
-            https://raw.githubusercontent.com/OpenPLi/OpenPLi-1/master/cdk/apps/tuxbox/libtuxbox/tuxbox.h
+          python3 "$GITHUB_WORKSPACE/packaging/fetch-source.py" file tuxbox-headers \
+            cdk/apps/tuxbox/libtuxbox/tuxbox.h /usr/include/tuxbox.h
           mkdir -p /usr/include/tuxbox
           for f in hardware_dbox2.h hardware_dreambox.h hardware_pci.h info.h info_dbox2.h kernel.h; do
-            curl -fsSL -o /usr/include/tuxbox/$f \
-              https://raw.githubusercontent.com/OpenPLi/OpenPLi-1/master/cdk/driver/include/tuxbox/$f
+            python3 "$GITHUB_WORKSPACE/packaging/fetch-source.py" file tuxbox-headers \
+              "cdk/driver/include/tuxbox/$f" "/usr/include/tuxbox/$f"
           done
           autoreconf -fi
           # tuxbox 宏的 DVB_API_VERSION cpp 提取在容器内失败，直接注入版本跳过检测
@@ -110,8 +138,8 @@ jobs:
         run: |
           # Debian 12 的 linux-libc-dev(6.1) 缺 SYS_DVBC2 等，用目标内核 HiSilicon linux-6.12.y 的 uapi 头覆盖
           for f in audio.h ca.h dmx.h frontend.h net.h osd.h version.h video.h; do
-            curl -fsSL -o /usr/include/linux/dvb/$f \
-              https://raw.githubusercontent.com/HiSilicon-Development/linux-6.12.y/main/include/uapi/linux/dvb/$f
+            python3 packaging/fetch-source.py file kernel-headers \
+              "include/uapi/linux/dvb/$f" "/usr/include/linux/dvb/$f"
           done
           # 原始 uapi 头含内核态注解 __user，等价 headers_install 剥离
           sed -i 's/\b__user\b//g' /usr/include/linux/dvb/*.h
@@ -129,30 +157,19 @@ jobs:
           ls -la /usr/lib/libtuxtxt*
 
       # ---- enigma2 本体 ----
+      - name: Checkout enigma2 (pin via source_refs.enigma2)
+        run: python3 packaging/fetch-source.py clone enigma2 enigma2
 
-      # 先 checkout 本仓库到 workspace 根（packaging/enigma.info 等打包资源在此），
-      # openatv/enigma2 再 checkout 到 enigma2/ 子目录，两者不冲突
-      - name: Checkout this repo (packaging files)
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
 
-      - name: Checkout enigma2 (openatv master)
-        uses: actions/checkout@v4
-        with:
-          repository: openatv/enigma2
-          ref: master
-          fetch-depth: 1
-          path: enigma2
-
-      # enigma2 上游补丁全部在 .ci/patches/（NN-*.py，按文件名字典序应用），
-      # 改补丁只动 .ci/ 下对应文件，不要编辑本工作流的补丁内容
-      - name: Apply patches (.ci/patches)
+      # One entrypoint owns compatibility, native HiSTB integration, maintained
+      # source patches, then vendor-procfs isolation. Anchors fail on drift.
+      - name: Prepare Enigma2 sources (.ci/apply_patches.py)
         run: python3 .ci/apply_patches.py enigma2
+
 
       - name: Prepare hivxe-ffmpeg headers
         run: |
-          git clone --depth 1 https://github.com/HiSilicon-Development/FFmpeg.git /tmp/hivxe-ff
+          python3 packaging/fetch-source.py clone hivxe-ffmpeg /tmp/hivxe-ff
           mkdir -p /tmp/hivxe-ff-include/libavcodec /tmp/hivxe-ff-include/libavutil /tmp/hivxe-ff-include/libswresample /tmp/hivxe-ff-include/libswscale
           cp /tmp/hivxe-ff/libavcodec/*.h /tmp/hivxe-ff-include/libavcodec/
           cp /tmp/hivxe-ff/libavutil/*.h /tmp/hivxe-ff-include/libavutil/
@@ -179,15 +196,14 @@ jobs:
           cd enigma2
           ./autogen.sh
           # OE-A 魔改版 ax_python_devel 的路径 sed hack 会污染 Debian multiarch 路径，
-          # 预置 PYTHON_CPPFLAGS/PYTHON_LIBS 跳过其自动检测；用自带的 Python 3.13
+          # Preselect Python flags to avoid OE's multiarch path rewrite.
           # HAVE_HISTB: histb 软件 decoder backend（dlopen hivxe-ffmpeg，不硬链接）
           # -I/usr/include/libdrm: xf86drm.h（/usr/include 顶层）内部 #include <drm.h>，
           # Debian libdrm-dev 把内核 DRM 头装在 /usr/include/libdrm/（非 /usr/include/drm/）
           CPPFLAGS="-DHAVE_HISTB -I/tmp/hivxe-ff-include -I/usr/include/libdrm" \
           LIBS="-lasound -ldrm -ldl" \
-          PYTHON_CPPFLAGS="-I/usr/local/include/python3.13" \
-          PYTHON_LIBS="-L/usr/local/lib -lpython3.13" \
           ./configure \
+            --sysconfdir=/etc \
             --with-gstversion=1.0 \
             --with-boxtype=${BOXTYPE} \
             --with-machinebuild=${MACHINEBUILD} \
@@ -206,7 +222,7 @@ jobs:
           # 不带它 NetworkManager 的 netInfo.link 恒 False → UI 一律显示
           # “网线未连接”（2026-10-30 盒子实测，实际网络正常）。
           # 单文件 C 程序，仅依赖 pthread，arm64 runner 原生编译。
-          git clone --depth 1 https://github.com/openatv/socketdaemon /tmp/socketdaemon
+          python3 packaging/fetch-source.py clone socketdaemon /tmp/socketdaemon
           cd /tmp/socketdaemon
           autoreconf -fi
           ./configure --prefix=/usr/local
@@ -218,11 +234,10 @@ jobs:
         run: |
           cd enigma2
           make install DESTDIR=/tmp/e2-staging
-          # skin_default 的图标资源（icons/buttons/extensions 等）不在 enigma2
-          # 主仓库，OE 由独立包 openatv/oe-alliance-e2-skindefault 提供；
-          # 缺失时 Satfinder 锁定图标、CableScan scan-c.png 等全部告警。
-          # 只拷资源目录，不覆盖 enigma2 master 的 skin_default.xml。
-          git clone --depth 1 https://github.com/openatv/oe-alliance-e2-skindefault /tmp/skindefault
+          # Stage the default-skin resource tree. prepare_runtime() also installs
+          # its root fallback XML, templates, preview and fonts from this checkout.
+          # Keep the source identity in the same lock as Enigma2 and OpenWebif.
+          python3 "$GITHUB_WORKSPACE/packaging/fetch-source.py" clone skindefault /tmp/skindefault
           mkdir -p /tmp/e2-staging/usr/local/share/enigma2/skin_default
           cp -a /tmp/skindefault/skin_default/. /tmp/e2-staging/usr/local/share/enigma2/skin_default/
           find /tmp/e2-staging -maxdepth 3 | head -30
@@ -231,45 +246,12 @@ jobs:
         run: |
           # 打包到 $GITHUB_WORKSPACE（容器挂载卷），upload-artifact 才能取到
 
-          # ---- 运行库：libdvbsi++ ----
-          # 实测（2026-11-02）：DESTDIR staging 偶发为空导致 deb 只有 control；
-          # 改为从容器 /usr/lib 显式拷贝（make install 已装好且 ls 验证过）
-          DVBDIR=$GITHUB_WORKSPACE/.pkg-libdvbsi
-          rm -rf ${DVBDIR}
-          mkdir -p ${DVBDIR}/DEBIAN ${DVBDIR}/usr/lib
-          cp -a /usr/lib/libdvbsi++.so* ${DVBDIR}/usr/lib/
-          ls -la ${DVBDIR}/usr/lib/
-          cat > ${DVBDIR}/DEBIAN/control <<EOF
-          Package: libdvbsi++
-          Version: ${E2VER}
-          Architecture: arm64
-          Maintainer: manhere <manhere@gmail.com>
-          Depends: libstdc++6
-          Description: DVB Service Information library (OpenVisionE2, runtime)
-           Built natively on Debian 12 arm64 via GitHub Actions.
-          Section: libs
-          Priority: optional
-          EOF
-          dpkg-deb --build --root-owner-group ${DVBDIR} $GITHUB_WORKSPACE/libdvbsi++_${E2VER}_arm64.deb
-
-          # ---- 运行库：libtuxtxt（含 libtuxtxt32bpp）----
-          # 同上：显式从 /usr/lib 拷贝，不依赖 DESTDIR staging
-          TXTDIR=$GITHUB_WORKSPACE/.pkg-libtuxtxt
-          rm -rf ${TXTDIR}
-          mkdir -p ${TXTDIR}/DEBIAN ${TXTDIR}/usr/lib
-          cp -a /usr/lib/libtuxtxt.so* /usr/lib/libtuxtxt32bpp.so* ${TXTDIR}/usr/lib/
-          ls -la ${TXTDIR}/usr/lib/
-          cat > ${TXTDIR}/DEBIAN/control <<EOF
-          Package: libtuxtxt
-          Version: ${E2VER}
-          Architecture: arm64
-          Maintainer: manhere <manhere@gmail.com>
-          Description: Teletext library and 32bpp renderer (oe-alliance, runtime)
-           Built natively on Debian 12 arm64 via GitHub Actions.
-          Section: libs
-          Priority: optional
-          EOF
-          dpkg-deb --build --root-owner-group ${TXTDIR} $GITHUB_WORKSPACE/libtuxtxt_${E2VER}_arm64.deb
+          # Keep only runtime shared libraries, require real ELF payload, and derive
+          # dependencies from the build distro's dpkg shlibs/symbols metadata.
+          python3 packaging/package-runtime.py library libdvbsi++ \
+            "$GITHUB_WORKSPACE/.pkg-libdvbsi" 'libdvbsi++.so.*'
+          python3 packaging/package-runtime.py library libtuxtxt \
+            "$GITHUB_WORKSPACE/.pkg-libtuxtxt" 'libtuxtxt.so.*' 'libtuxtxt32bpp.so.*'
 
           # ---- enigma2 本体 ----
           PKGDIR=$GITHUB_WORKSPACE/enigma2-hi3798cv200_${E2VER}_arm64
@@ -277,6 +259,10 @@ jobs:
           cp -a /tmp/e2-staging/* ${PKGDIR}/
           # ---- socketdaemon（NetworkManager 链路状态数据源）----
           cp -a /tmp/sd-staging/usr/local/bin/socketdaemon ${PKGDIR}/usr/local/bin/socketdaemon
+          g++ -std=c++17 -O2 $(pkg-config --cflags libdrm libpng libjpeg) \
+            -Ipackaging packaging/histb-screenshot.cpp \
+            -o ${PKGDIR}/usr/local/bin/histb-screenshot \
+            $(pkg-config --libs libdrm libpng libjpeg)
 
           # enigma2 启动必需的机器信息文件（OE 构建系统产物，BoxInfo 从这里读
           # machinebuild/socfamily 等；checksum 已按 enigma2 md5 算法生成）
@@ -323,15 +309,13 @@ jobs:
           echo "locale packages: $(ls ${PKGDIR}/var/lib/opkg/info | wc -l)"
           ls ${PKGDIR}/var/lib/opkg/info | head -8
 
-          # ---- 频率表（OE 发行层文件，enigma2 仓库不含）----
-          # C++ db.cpp 硬编码 /etc/enigma2/*.xml（我们已把 /etc/enigma2 符号
-          # 链接到 /usr/local/etc/enigma2）。缺失时 cablesList 为空，DVB-C
+          # Frequency tables are defaults, not replacements for user configuration.
           # 搜台界面 ScanSetup 读 scan_provider.index 直接 IndexError
           # （2026-10-30 盒子实测）；satellites.xml 缺失则无法配置/搜索卫星。
-          git clone --depth 1 https://github.com/oe-alliance/oe-alliance-tuxbox-common /tmp/tuxbox-common
-          mkdir -p ${PKGDIR}/usr/local/etc/enigma2
+          python3 packaging/fetch-source.py clone tuxbox-common /tmp/tuxbox-common
+          mkdir -p ${PKGDIR}/etc/enigma2
           for x in satellites cables terrestrial atsc; do
-            cp -f /tmp/tuxbox-common/src/$x.xml ${PKGDIR}/usr/local/etc/enigma2/$x.xml
+            cp -f /tmp/tuxbox-common/src/$x.xml ${PKGDIR}/etc/enigma2/$x.xml
           done
           # Components/Timezones.py 硬编码 /etc/timezone.xml
           mkdir -p ${PKGDIR}/etc
@@ -339,73 +323,38 @@ jobs:
 
           # ---- OE 发行层 Python 模块（enigma2 源码 import 但不在仓库内）----
           # Tools/Weatherinfo.py：MyMetrixLite 皮肤插件依赖，缺失即插件加载失败
-          git clone --depth 1 https://github.com/openatv/WeatherInfo /tmp/WeatherInfo
+          python3 packaging/fetch-source.py clone weatherinfo /tmp/WeatherInfo
           mkdir -p ${PKGDIR}/usr/local/lib/enigma2/python/Tools
           cp -f /tmp/WeatherInfo/Weatherinfo.py ${PKGDIR}/usr/local/lib/enigma2/python/Tools/Weatherinfo.py
           # process.py：Screens/NetworkServices.py "from process import ProcessList"
           # （OE python3-process 包，缺失时进程列表入口崩溃）
-          curl -sf -o ${PKGDIR}/usr/local/lib/enigma2/python/process.py \
-            https://raw.githubusercontent.com/oe-alliance/oe-alliance-core/master/meta-oe/recipes-devtools/python/python3-process/process.py
-          ls -la ${PKGDIR}/usr/local/etc/enigma2/*.xml ${PKGDIR}/etc/timezone.xml \
+          python3 packaging/fetch-source.py file oe-alliance-core \
+            meta-oe/recipes-devtools/python/python3-process/process.py \
+            ${PKGDIR}/usr/local/lib/enigma2/python/process.py
+          ls -la ${PKGDIR}/etc/enigma2/*.xml ${PKGDIR}/etc/timezone.xml \
                  ${PKGDIR}/usr/local/lib/enigma2/python/Tools/Weatherinfo.py \
                  ${PKGDIR}/usr/local/lib/enigma2/python/process.py
 
-          # ---- 内嵌 Python 3.13 运行时（libpython + stdlib + twisted）----
-          mkdir -p ${PKGDIR}/usr/local/lib ${PKGDIR}/etc/ld.so.conf.d
-          cp -a /usr/local/lib/libpython3.13.so* ${PKGDIR}/usr/local/lib/
-          cp -a /usr/local/lib/python3.13 ${PKGDIR}/usr/local/lib/
-          # python3.13 解释器本体（enigma2 内嵌 libpython 能跑，但盒子端
-          # 无解释器无法做诊断/解包；一起打包）
-          mkdir -p ${PKGDIR}/usr/local/bin
-          cp -a /usr/local/bin/python3.13 ${PKGDIR}/usr/local/bin/python3.13
+          # Debian 13 uses its supported system interpreter and apt Python modules.
+          # Only Debian 12 needs the newer embedded interpreter for PEP 701.
+          if [ '${{ matrix.debian }}' = 12 ]; then
+            mkdir -p ${PKGDIR}/usr/local/lib ${PKGDIR}/etc/ld.so.conf.d
+            cp -a /usr/local/lib/libpython3.13.so* ${PKGDIR}/usr/local/lib/
+            cp -a /usr/local/lib/python3.13 ${PKGDIR}/usr/local/lib/
+            mkdir -p ${PKGDIR}/usr/local/bin
+            cp -a /usr/local/bin/python3.13 ${PKGDIR}/usr/local/bin/python3.13
+          fi
           # enigma2 裸二进制改为 .bin + 同名管理脚本（OE enigma2.sh 语义）：
           # 设置界面“重启 E2”调 quitMainloop(3) 后进程直接退出，必须由
           # 外层循环按退出码拉起（Screens/Standby.py: 1=关机 2=整机重启
           # 3=重启UI 5=出错重启 15/16/17=Kodi等 42-44=升级 45=WOL关机）；
           # 关机/重启同样由退出码驱动。
           mv ${PKGDIR}/usr/local/bin/enigma2 ${PKGDIR}/usr/local/bin/enigma2.bin
-          cat > ${PKGDIR}/usr/local/bin/enigma2 <<'SH'
-          #!/bin/sh
-          # OE enigma2.sh equivalent: UI supervisor loop driven by
-          # quitMainloop exit codes (Screens/Standby.py QUIT_*).
-          # 自带 Python 固定: enigma2 main() 里 setenv PYTHONHOME=/usr
-          # (overwrite=0, OE 生态默认前缀), 在 Debian rootfs 上会被解析到
-          # 系统 stdlib /usr/lib/python3.13 → builtin 集合不匹配缺 math。
-          # export 后 enigma2 不再覆盖, 强制使用自带 /usr/local/lib/python3.13。
-          export PYTHONHOME=/usr/local
-          # 自带 libpython 优先: 一旦系统带入 libpython3.13（如 apt install gdb
-          # 的依赖链），ldconfig 缓存中 /lib/aarch64-linux-gnu 先于
-          # /usr/local/lib，enigma2.bin 会被劫持到系统库 → prefix=/usr →
-          # 系统 stdlib/site.py → 自带 site-packages（twisted/pyusb/CT3/PIL）
-          # 失联 → BSOD 崩溃循环。显式 LD_LIBRARY_PATH 锁定自带库。
-          export LD_LIBRARY_PATH=/usr/local/lib
-          BIN=/usr/local/bin/enigma2.bin
-          # NetworkManager 的 /var/run/netinfo 数据源（链路/网速/流量/因特网
-          # 检测），E2 启动前拉起；daemon 自身绑定固定 socket，重复启动
-          # 会自行退出，无重复实例风险。
-          start-stop-daemon -S -b -x /usr/local/bin/socketdaemon 2>/dev/null
-          while :; do
-              ${BIN} "$@"
-              ret=$?
-              case $ret in
-                  1|45)                    # QUIT_SHUTDOWN / QUIT_WOLSHUTDOWN
-                      poweroff 2>/dev/null || halt
-                      break
-                      ;;
-                  2)                       # QUIT_REBOOT
-                      reboot
-                      break
-                      ;;
-                  3|5|6|15|16|17|42|43|44) # restart UI variants incl. error restart
-                      ;;
-                  *)                       # clean/unknown exit: leave it dead
-                      break
-                      ;;
-              esac
-          done
-          start-stop-daemon -K -x /usr/local/bin/socketdaemon 2>/dev/null
-          SH
+          # The wrapper prioritizes bundled libpython only when the package's
+          # bundled-Python marker exists; Debian 13 keeps system Python.
+          cp packaging/enigma2 ${PKGDIR}/usr/local/bin/enigma2
           chmod 755 ${PKGDIR}/usr/local/bin/enigma2
+          if [ '${{ matrix.debian }}' = 12 ]; then
           # 瘦身：测试套件/构建配置/备件不需要
           rm -rf ${PKGDIR}/usr/local/lib/python3.13/test \
                  ${PKGDIR}/usr/local/lib/python3.13/idlelib \
@@ -425,11 +374,12 @@ jobs:
           find ${PKGDIR}/usr/local/lib/python3.13/site-packages -maxdepth 1 -mindepth 1 | head
           # libpython3.13 的动态链接查找路径
           echo "/usr/local/lib" > ${PKGDIR}/etc/ld.so.conf.d/enigma2-python.conf
+          fi
 
           # ---- MetrixHD 默认皮肤（openATV 官方 skin 包）----
           # skin.py DEFAULT_SKIN=MetrixHD/skin.xml，缺失时 emergency skin
           # （skin_default/skin.xml，OE 发行层产物）也不存在 → dirname(None) 崩溃
-          git clone --depth 1 https://github.com/openatv/MetrixHD /tmp/MetrixHD
+          python3 packaging/fetch-source.py clone metrixhd /tmp/MetrixHD
           mkdir -p ${PKGDIR}/usr/local/share/enigma2 ${PKGDIR}/usr/local/lib/enigma2/python
           cp -a /tmp/MetrixHD/usr/share/enigma2/MetrixHD ${PKGDIR}/usr/local/share/enigma2/
           cp -a /tmp/MetrixHD/usr/lib/enigma2/python/Components ${PKGDIR}/usr/local/lib/enigma2/python/
@@ -440,7 +390,12 @@ jobs:
           # plugin/ 整目录平移到 Plugins/Extensions/OpenWebif 即完成安装；
           # WHERE_SESSIONSTART 自动起 Web 服务（默认 80 端口）。
           # 运行期依赖：twisted/pyOpenSSL（已带）+ Cheetah（上方 pip 已装 CT3 fork）
-          git clone --depth 1 https://github.com/oe-alliance/OpenWebif /tmp/OpenWebif
+          python3 packaging/fetch-source.py clone openwebif /tmp/OpenWebif
+          python3 packaging/apply-openwebif.py /tmp/OpenWebif
+          npm ci --prefix /tmp/OpenWebif/sourcefiles --ignore-scripts --no-audit --no-fund
+          npm ci --prefix /tmp/OpenWebif/sourcefiles/modern --ignore-scripts --no-audit --no-fund
+          npm run build-classic-js --prefix /tmp/OpenWebif/sourcefiles
+          npm run build-prod --prefix /tmp/OpenWebif/sourcefiles/modern
           OWIFDIR=${PKGDIR}/usr/local/lib/enigma2/python/Plugins/Extensions/OpenWebif
           mkdir -p ${OWIFDIR}
           cp -a /tmp/OpenWebif/plugin/. ${OWIFDIR}/
@@ -458,59 +413,17 @@ jobs:
           mkdir -p ${PKGDIR}/usr/share/fonts
           cp -f /tmp/tuxtxt/tuxtxt/font/tuxtxt.ttf ${PKGDIR}/usr/share/fonts/tuxtxt.ttf
 
-          # ---- VDEC 解码固件（histb-vdec 内核驱动 request_firmware）----
-          #   histb-avsp.bin        AVS/AVS+ SCD 机器程序（17920B，
-          #                         HiVXE-2.0 官方重构件，源 HiSTB
-          #                         vfmw_v5.0 product Hi3798CV200 scd_drv.S
-          #                         g_avsp_firmware，sha256 4ec0ea0b...）
-          #   histb-h264-cabac.bin  H.264 CABAC 表（5120B，vfmw
-          #                         vdm_hal_h264.S H264HAL_V4R3C1_InitHal
-          #                         原样 memcpy 的 g_CabacMN 提取）
-          #   histb-hevc-cabac.bin  HEVC CABAC 表（928B=464 entries，
-          #                         vfmw vdm_hal_hevc.S HEVCWriteCabacTab
-          #                         运行时由 s_InitValue 按 HEVC 规范
-          #                         m=slope*5-45 / n=(offset<<3)-16 变换
-          #                         后 16bit 字节交换写入，本 bin 为
-          #                         同一变换的离线重构）
-          # 固件缺失时对应格式解码请求直接失败（AVS/AVS+ 台全黑）。
-          mkdir -p ${PKGDIR}/lib/firmware/hisilicon
-          cp ${GITHUB_WORKSPACE}/packaging/firmware/hisilicon/*.bin ${PKGDIR}/lib/firmware/hisilicon/
+          # Firmware belongs to the target kernel installation. Never ship or
+          # overwrite /lib/firmware/hisilicon (or install a kernel/FFmpeg here).
 
-          # ---- fake /var/stb 文件树（配合源码 /proc/stb → /var/stb 重定向）----
-          # 数值节点全部 hex 文本（CFile::parseIntHex 解析）：
-          #   xres=1920(780) yres=1080(438) framerate=50(32) aspect=1(16:9)
-          # dst_* 为画面定位写入目标，初值任意（E2 会重写）。
-          mkdir -p ${PKGDIR}/var/stb/vmpeg/0 ${PKGDIR}/var/stb/video ${PKGDIR}/var/stb/avs/0
-          printf 780 > ${PKGDIR}/var/stb/vmpeg/0/xres
-          printf 438 > ${PKGDIR}/var/stb/vmpeg/0/yres
-          printf 1 > ${PKGDIR}/var/stb/vmpeg/0/aspect
-          printf 32 > ${PKGDIR}/var/stb/vmpeg/0/framerate
-          printf 32 > ${PKGDIR}/var/stb/vmpeg/0/fallback_framerate
-          printf 1 > ${PKGDIR}/var/stb/vmpeg/0/progressive
-          printf 0 > ${PKGDIR}/var/stb/vmpeg/0/dst_top
-          printf 0 > ${PKGDIR}/var/stb/vmpeg/0/dst_left
-          printf 500 > ${PKGDIR}/var/stb/vmpeg/0/dst_width
-          printf 2d0 > ${PKGDIR}/var/stb/vmpeg/0/dst_height
-          printf 0 > ${PKGDIR}/var/stb/vmpeg/0/dst_apply
-          printf ff > ${PKGDIR}/var/stb/video/alpha
-          printf 1 > ${PKGDIR}/var/stb/video/aspect
-          printf bestfit > ${PKGDIR}/var/stb/video/policy
-          printf bestfit > ${PKGDIR}/var/stb/video/policy2
-          printf bestfit > ${PKGDIR}/var/stb/video/policy_choices
-          printf 720p50 > ${PKGDIR}/var/stb/video/videomode
-          printf 720p50 > ${PKGDIR}/var/stb/video/videomode_50hz
-          printf 720p24 > ${PKGDIR}/var/stb/video/videomode_24hz
-          printf 720p60 > ${PKGDIR}/var/stb/video/videomode_60hz
-          printf '720p50 720p25 1080i50 1080p50 2160p50\n' > ${PKGDIR}/var/stb/video/videomode_choices
-          printf encoder > ${PKGDIR}/var/stb/avs/0/input
-          printf encoder > ${PKGDIR}/var/stb/avs/0/input_choices
-          printf Hdmi > ${PKGDIR}/var/stb/avs/0/colorformat
+          # Hardware capabilities and metadata come from actual backends.
+          # Do not ship a simulated /var/stb control tree.
 
           # ---- systemd 开机自启单元 ----
           # enigma2 必须经 supervisor wrapper（/usr/local/bin/enigma2）启动，
           # 它承担 OE enigma2.sh 的退出码语义（重启UI/关机/重启）。
-          # ExecStartPre 等 /dev/dvb 就绪，规避开机竞态；Restart=always 兜底
-          # wrapper 对未知退出码的主动退出。
+          # Settle device events without waiting for an optional DVB tuner.
+          # Restart=always also covers the supervisor's unknown exit codes.
           mkdir -p ${PKGDIR}/etc/systemd/system
           cat > ${PKGDIR}/etc/systemd/system/e2.service <<'UNIT'
           [Unit]
@@ -520,94 +433,30 @@ jobs:
 
           [Service]
           Type=simple
-          ExecStartPre=/bin/sh -c 'i=0; until [ -e /dev/dvb/adapter0/frontend0 ] || [ $i -ge 30 ]; do sleep 1; i=$((i+1)); done'
+          ExecStartPre=/usr/bin/udevadm settle --timeout=10
           ExecStart=/usr/local/bin/enigma2
           Restart=always
           RestartSec=5
           Environment=HOME=/root
+          RuntimeDirectory=enigma2
+          RuntimeDirectoryMode=0700
 
           [Install]
           WantedBy=multi-user.target
           UNIT
 
-          cat > ${PKGDIR}/DEBIAN/postinst <<'SH'
-          #!/bin/sh
-          set -e
-          ldconfig
-          # enigma2 假定 OE 镜像的 opkg 包管理布局（International/SystemInfo 等直接列目录），
-          # Debian 是 dpkg——补空目录消除启动 FileNotFoundError
-          mkdir -p /var/lib/opkg/info /var/lib/opkg/lists /etc/opkg
-          # 皮肤/插件大量硬编码 /usr/share/enigma2（MetrixHD skin.xml 6 处、
-          # OpenWebif root.py/defaults.py 等）——整目录符号链接一次覆盖
-          if [ ! -L /usr/share/enigma2 ]; then
-            rm -rf /usr/share/enigma2
-            ln -sfn /usr/local/share/enigma2 /usr/share/enigma2
-          fi
-          # 上游 Python 源码同样硬编码 /etc/enigma2/（ChannelSelection.py:1479
-          # listdir("/etc/enigma2/")、resumepoints.pkl、epg.dat 等）——
-          # 链到真实配置目录（--prefix=/usr/local → sysconfdir 偏差一次纠正）
-          if [ ! -L /etc/enigma2 ]; then
-            rm -rf /etc/enigma2
-            ln -sfn /usr/local/etc/enigma2 /etc/enigma2
-          fi
-          # 中国大陆 DVB-C 的 SDT/EPG 文本多为 GB2312/GBK 且不带 DVB 编码首字节，
-          # enigma2 默认按 Latin-1/ISO6937 解释 → 中文名乱码（scan.cpp:1937 服务名
-          # 转换只认 encoding.conf 的转发器映射和 "*" 全局默认，不走国家码映射）。
-          # "* GB18030" 行把 defaultEncodingTable 设为 GB18030，仅当 SI 无编码
-          # 首字节时生效，不影响自带 UTF-8/其他编码声明的流。
-          if [ ! -f /usr/local/etc/enigma2/encoding.conf ]; then
-            printf '* GB18030\n' > /usr/local/etc/enigma2/encoding.conf
-          fi
-          # 预置默认 favourites bouquet：OE 镜像由 defaults 包提供，本包此前
-          # 不带 → bouquets.tv 里的 FROM BOUQUET "userbouquet.favourites.tv"
-          # 条目指向缺失文件，名字解析失败后频道列表直接显示引用原文
-          # （2026-10-30 盒子实测）。幂等：不覆盖用户已有文件。
-          if [ ! -f /usr/local/etc/enigma2/userbouquet.favourites.tv ]; then
-            printf '#NAME Favourites (TV)\n' > /usr/local/etc/enigma2/userbouquet.favourites.tv
-          fi
-          if [ ! -f /usr/local/etc/enigma2/userbouquet.favourites.radio ]; then
-            printf '#NAME Favourites (Radio)\n' > /usr/local/etc/enigma2/userbouquet.favourites.radio
-          fi
-          # UsageConfig 启动时写 /etc/tuxtxt/tuxtxt2.conf（tuxtxt 字幕配置）
-          mkdir -p /etc/tuxtxt
-          # 开机自启：enable 幂等（离线建 symlink，无需 systemd 运行中）
-          systemctl enable e2.service 2>/dev/null || true
-          SH
+          cp packaging/enigma2.postinst ${PKGDIR}/DEBIAN/postinst
           chmod 755 ${PKGDIR}/DEBIAN/postinst
-
-          # Depends 依据 2026-11-02 盒子 trixie 上 objdump -p enigma2.bin 的
-          # NEEDED 实测重写（宽依赖 667MB 教训）：
-          # - gstreamer 四个插件包只服务媒体播放器路径（运行期 dlopen），
-          #   与 DVB 收看链路（avcodec->ALSA / histb 硬解）无关，2026-11-02
-          #   按最小依赖原则整体移除；需要媒体播放器时手动
-          #   apt install gstreamer1.0-plugins-{base,good,bad} gstreamer1.0-libav。
-          #   二进制硬链接的 gstreamer 核心两库仍进 Depends
-          # - 补齐 NEEDED 中此前缺失的：libasound2/libpython3.13/libjpeg62/
-          #   libpng16/libxml2/libssl3/libcurl4/libgomp1/libdrm2
-          # - libswscale.so.6 为硬 NEEDED，trixie 无此包，盒子侧用
-          #   symlink libswscale.so.6->.8 兼容（公开 API 6->8 未变）
-          # - t64 过渡改名包保持 "t64 | 旧名" 双候选兼容 bookworm
-          cat > ${PKGDIR}/DEBIAN/control <<EOF
-          Package: enigma2-hi3798cv200
-          Version: ${E2VER}
-          Architecture: arm64
-          Maintainer: manhere <manhere@gmail.com>
-          Depends: libglib2.0-0t64 | libglib2.0-0, libfreetype6, libfribidi0, libsigc++-3.0-0, libdvbsi++, libtuxtxt, libavahi-client3, libavahi-common3, libwebp7, libsharpyuv0, libgif7, libpng16-16t64 | libpng16-16, libxml2, libssl3t64 | libssl3, libcurl4t64 | libcurl4, libjpeg62-turbo, libasound2t64 | libasound2, libdrm2, libgomp1, libgstreamer1.0-0, libgstreamer-plugins-base1.0-0, zlib1g, libbz2-1.0, liblzma5, libffi8, libreadline8t64 | libreadline8, libsqlite3-0, libncursesw6, libuuid1
-          Description: enigma2 (openATV 8.0) for HiSilicon Hi3798CV200 DVBIP-1002
-           Built natively on Debian 12 arm64 via GitHub Actions.
-           Depends tuned for Debian 13 (trixie) rootfs; bookworm needs python3.13.
-          Section: video
-          Priority: optional
-          EOF
-          dpkg-deb --build --root-owner-group ${PKGDIR}
-          ls -la ${GITHUB_WORKSPACE}/*.deb
+          E2_SOURCE_COMMIT=$(git -C enigma2 rev-parse HEAD) SKINDEFAULT_SOURCE_DIR=/tmp/skindefault \
+            python3 packaging/package-runtime.py enigma2 "${PKGDIR}"
 
       - name: Upload .deb artifact
         uses: actions/upload-artifact@v4
         with:
-          name: enigma2-debian12-arm64
+          name: enigma2-debian${{ matrix.debian }}-arm64
           path: |
             enigma2-hi3798cv200*.deb
             libdvbsi++*.deb
             libtuxtxt*.deb
+            sources.lock.json
           if-no-files-found: error

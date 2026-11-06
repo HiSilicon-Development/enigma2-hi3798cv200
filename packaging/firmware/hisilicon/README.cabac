@@ -32,3 +32,12 @@ eb04288c3fa644565f9d71931918cf27f02022ffb77b4343383b80d2dcfff972)
   The m/n formulas are exactly the HEVC spec preCtxState coefficients
   (slopeIdx*5 - 45, (offsetIdx << 3) - 16), so the reconstruction is
   constrained by the standard, not just by the disassembly.
+
+The matching kernel's generate-h264-cabac.py and generate-hevc-cabac.py
+reproduce these byte images from the CV200 32-bit assembly inputs selected
+by firmware/hisilicon/Makefile. The source variants above provide independent
+byte-level correspondence, not a requirement to use a particular checkout
+path. See README.avsp for the common generation command.
+
+These descriptions and hashes are provenance information, not an additional
+licence grant for the underlying input files or generated payloads.

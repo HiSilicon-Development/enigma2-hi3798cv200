@@ -1,0 +1,49 @@
+--- a/lib/gdi/gmaindc.h
++++ b/lib/gdi/gmaindc.h
+@@ -16,6 +16,7 @@
+ 	virtual ~gMainDC();
+ public:
+ 	virtual void setResolution(int xres, int yres, int bpp = 32) = 0;
++	eSize getResolution() { return size(); }
+ 	virtual bool suspendGraphics() { return false; }
+ 	virtual bool resumeGraphics() { return false; }
+ 	virtual bool isGraphicsSuspended() const { return false; }
+
+--- a/lib/gdi/gfbdc.cpp
++++ b/lib/gdi/gfbdc.cpp
+@@ -427,6 +427,11 @@
+ 		grc->lock();
+ #endif
+ 	fb->SetMode(xres, yres, bpp);
++#ifdef HAVE_HISTB
++	// DRM fbdev can retain the native mode after rejecting the skin's mode.
++	// Never describe or allocate surfaces using dimensions the driver rejected.
++	fb->getMode(xres, yres, bpp);
++#endif
+ 
+ 	unsigned char *base_addr = fb->lfb;
+ 	unsigned long base_phys = fb->getPhysAddr();
+@@ -439,7 +444,7 @@
+ 	surface.data = base_addr;
+ 
+ 	for (int y=0; y<yres; y++) // make whole screen transparent
+-		memset(fb->lfb+ y * xres * 4, 0x00, xres * 4);
++		memset(fb->lfb + y * surface.stride, 0x00, xres * surface.bypp);
+ 
+ 	surface.data_phys = base_phys;
+ 
+
+--- a/lib/python/skin.py
++++ b/lib/python/skin.py
+@@ -168,8 +168,9 @@
+ 		loadSkin(USER_SKIN, scope=SCOPE_GUISKIN, desktop=getDesktop(GUI_SKIN_ID), screenID=GUI_SKIN_ID)
+ 	resolution = resolutions.get(GUI_SKIN_ID, (0, 0, 0))
+ 	if resolution[0] and resolution[1]:
+-		gMainDC.getInstance().setResolution(resolution[0], resolution[1])
+-		getDesktop(GUI_SKIN_ID).resize(eSize(resolution[0], resolution[1]))
++		dc = gMainDC.getInstance()
++		dc.setResolution(resolution[0], resolution[1])
++		getDesktop(GUI_SKIN_ID).resize(dc.getResolution())
+ 	runCallbacks = True  # noqa F841
+ 	# Load all XML templates.
+ 	reloadSkinTemplates()

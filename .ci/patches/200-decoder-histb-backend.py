@@ -11,16 +11,24 @@
 import os
 import shutil
 
-# 幂等守卫：decoder.cpp 已接入 histb 后端时整段跳过（重跑安全）
-if '#include <lib/dvb/decoder_histb_impl.h>' in open('lib/dvb/decoder.cpp').read():
+# Install every local backend dependency even when the source is already wired.
+packaging = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'packaging')
+for header in ('decoder_histb_impl.h', 'histb_video_capture_impl.h',
+               'histb_audio_control.h', 'histb_video_entry.h'):
+    shutil.copy(os.path.join(packaging, header), os.path.join('lib/dvb', header))
+
+# Source wiring is independent of the refreshed implementation headers.
+decoder = open('lib/dvb/decoder.cpp').read()
+if '#include <lib/dvb/decoder_histb_impl.h>' in decoder:
+    header = open('lib/dvb/decoder.h').read()
+    required = ('#ifdef HAVE_HISTB\n#include <lib/dvb/decoder_histb_impl.h>\n#else\nDEFINE_REF(eDVBAudio);',
+                '#endif /* HAVE_HISTB */\n\nDEFINE_REF(eTSMPEGDecoder);',
+                '#ifdef HAVE_HISTB\n\t\tm_has_audio = true;\n#endif')
+    if header.count('void *m_histb = nullptr;') != 4 or any(decoder.count(anchor) != 1 for anchor in required):
+        raise SystemExit('decoder histb wiring incomplete - upstream changed, review needed')
     print('decoder histb backend already wired')
     import sys
     sys.exit(0)
-
-# decoder_histb_impl.h 是本仓库打包资源（相对脚本定位，与 checkout 位置无关）
-shutil.copy(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..',
-                         'packaging', 'decoder_histb_impl.h'),
-            'lib/dvb/decoder_histb_impl.h')
 
 p = 'lib/dvb/decoder.h'
 s = open(p).read()

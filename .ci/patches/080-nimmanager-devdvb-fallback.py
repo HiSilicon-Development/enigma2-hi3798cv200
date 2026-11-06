@@ -106,4 +106,3 @@ if old in s:
     s = s.replace(anchor, method, 1)
     open(p, 'w').write(s)
 print('NimManager.py /dev/dvb fallback NIM enumeration patched')
-

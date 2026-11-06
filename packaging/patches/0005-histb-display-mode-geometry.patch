@@ -1,0 +1,729 @@
+--- a/lib/gdi/fb.cpp
++++ b/lib/gdi/fb.cpp
+@@ -1,3 +1,6 @@
++#ifdef HAVE_HISTB
++#include <lib/driver/histb_drm.h>
++#endif
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <fcntl.h>
+@@ -42,6 +45,13 @@
+ 	locked=0;
+ 	lfb = 0;
+ 	available=0;
++	fbFd = -1;
++	xRes = yRes = stride = bpp = m_phys_mem = 0;
++	m_number_of_pages = 0;
++	memset(&screeninfo, 0, sizeof(screeninfo));
++#ifdef HAVE_HISTB
++	m_drm_backing = false;
++#endif
+ 	cmap.start=0;
+ 	cmap.len=256;
+ 	cmap.red=red;
+@@ -60,7 +70,37 @@
+ 	fbFd=open(fb, O_RDWR);
+ 	if (fbFd<0)
+ 	{
++#ifdef HAVE_HISTB
++		const int openError = errno;
++#endif
+ 		eDebug("[fb] %s %m", fb);
++#ifdef HAVE_HISTB
++		if (openError == ENOENT || openError == ENODEV || openError == ENXIO)
++		{
++			auto &session = histbDrmSession();
++			std::lock_guard<std::mutex> lock(session.mutex);
++			if (histbOsdCreateCanvas())
++			{
++				const auto &canvas = session.canvas;
++				m_drm_backing = true;
++				lfb = canvas.map;
++				available = canvas.size;
++				/* GEM CPU mappings expose no physical DMA address. Zero keeps
++				 * the existing software UI drawing path, not fake acceleration. */
++				m_phys_mem = 0;
++				xRes = screeninfo.xres = screeninfo.xres_virtual = canvas.width;
++				yRes = screeninfo.yres = screeninfo.yres_virtual = canvas.height;
++				bpp = screeninfo.bits_per_pixel = 32;
++				screeninfo.transp.offset = 24; screeninfo.transp.length = 8;
++				screeninfo.red.offset = 16; screeninfo.red.length = 8;
++				screeninfo.green.offset = 8; screeninfo.green.length = 8;
++				screeninfo.blue.offset = 0; screeninfo.blue.length = 8;
++				stride = canvas.pitch;
++				m_number_of_pages = 1;
++				return;
++			}
++		}
++#endif
+ 		goto nolfb;
+ 	}
+ 
+@@ -166,9 +206,10 @@
+ 	lfb=(unsigned char*)mmap(0, available, PROT_WRITE|PROT_READ, MAP_SHARED, fbFd, 0);
+ #endif
+ #ifndef CONFIG_ION
+-	if (!lfb)
++	if (!lfb || lfb == MAP_FAILED)
+ 	{
+ 		eDebug("[fb] mmap %m");
++		lfb = 0;
+ 		goto nolfb;
+ 	}
+ #endif
+@@ -178,6 +219,8 @@
+ 	enableManualBlit();
+ 	return;
+ nolfb:
++	available = 0;
++	m_phys_mem = 0;
+ 	if (fbFd >= 0)
+ 	{
+ 		::close(fbFd);
+@@ -203,7 +246,39 @@
+ 
+ int fbClass::SetMode(int nxRes, int nyRes, int nbpp)
+ {
++#ifdef HAVE_HISTB
++	if (fbFd < 0 && !m_drm_backing) return -1;
++	// The skin selects GP0 source geometry within the exact mapped backing,
++	// not a new fbdev/HDMI mode or a tightly packed replacement buffer.
++	fb_var_screeninfo native = screeninfo;
++	fb_fix_screeninfo nativeFix = {};
++	if (m_drm_backing)
++	{
++		nativeFix.line_length = stride;
++		nativeFix.smem_len = available;
++	}
++	else if (ioctl(fbFd, FBIOGET_VSCREENINFO, &native) < 0 || ioctl(fbFd, FBIOGET_FSCREENINFO, &nativeFix) < 0)
++	{
++		eWarning("[fb] cannot query native framebuffer backing: %m");
++		return -1;
++	}
++	if (nbpp != 32 || native.bits_per_pixel != 32 || nxRes <= 0 || nyRes <= 0 ||
++		(unsigned int)nxRes > native.xres || (unsigned int)nyRes > native.yres ||
++		native.xoffset || native.yoffset ||
++		nativeFix.line_length < uint64_t(native.xres) * 4 || uint64_t(nativeFix.line_length) * native.yres > nativeFix.smem_len ||
++		!histbOsdSetGeometry(nxRes, nyRes, native.xres, native.yres, nativeFix.line_length))
++	{
++		eWarning("[fb] cannot apply logical canvas %dx%dx%d; retaining previous geometry", nxRes, nyRes, nbpp);
++		return -1;
++	}
++	screeninfo = native;
++	xRes = nxRes; yRes = nyRes; bpp = nbpp;
++	stride = nativeFix.line_length;
++	m_number_of_pages = 1;
++	return 0;
++#else
+ 	if (fbFd < 0) return -1;
++#endif
+ #ifdef CONFIG_ION
+ 	/* unmap old framebuffer with old size */
+ 	if (lfb)
+@@ -350,6 +425,15 @@
+ 	xres = screeninfo.xres;
+ 	yres = screeninfo.yres;
+ 	bpp = screeninfo.bits_per_pixel;
++#ifdef HAVE_HISTB
++	auto &session = histbDrmSession();
++	std::lock_guard<std::mutex> lock(session.mutex);
++	if (session.sourceW && session.sourceH)
++	{
++		xres = session.sourceW;
++		yres = session.sourceH;
++	}
++#endif
+ }
+ 
+ int fbClass::setOffset(int off)
+@@ -387,6 +471,16 @@
+ 
+ fbClass::~fbClass()
+ {
++#ifdef HAVE_HISTB
++	if (m_drm_backing)
++	{
++		/* Session owns FB, GEM handle and mapping together. RMFB completes
++		 * before userspace releases memory that may have reached GP0. */
++		histbOsdReleaseCanvas();
++		lfb = 0;
++		return;
++	}
++#endif
+ #ifdef CONFIG_ION
+ 	if (m_accel_fd > -1)
+ 		close(m_accel_fd);
+@@ -413,6 +507,7 @@
+ 
+ int fbClass::lock()
+ {
++	if (fbFd < 0) return -1;
+ 	if (locked)
+ 		return -1;
+ 	if (m_manual_blit == 1)
+--- a/lib/gdi/fb.h
++++ b/lib/gdi/fb.h
+@@ -22,6 +22,9 @@
+ 	int m_manual_blit;
+ 	int m_number_of_pages;
+ 	int m_phys_mem;
++#ifdef HAVE_HISTB
++	bool m_drm_backing;
++#endif
+ #ifdef SWIG
+ 	fbClass(const char *fb=FB_DEV);
+ 	~fbClass();
+--- a/lib/gdi/gfbdc.cpp
++++ b/lib/gdi/gfbdc.cpp
+@@ -55,6 +55,12 @@
+ 	int bpp;
+ 	fb->getMode(xres, yres, bpp);
+ 
++#ifdef HAVE_HISTB
++	/* The boot fbdev may inherit UHD. Before a skin selects its logical
++	 * canvas, choose a supported GP0 source within that existing backing. */
++	if (xres >= 1920 && yres >= 1080) { xres = 1920; yres = 1080; }
++	else if (xres >= 1280 && yres >= 720) { xres = 1280; yres = 720; }
++#else
+ 	/* we can only use one of these three modes: */
+ 	if (!((xres == 720 && yres == 576)
+ 		|| (xres == 1280 && yres == 720)
+@@ -64,6 +70,7 @@
+ 		xres = 720;
+ 		yres = 576;
+ 	}
++#endif
+ 
+ 	surface.clut.data = 0;
+ 	setResolution(xres, yres); // default res
+@@ -426,11 +433,15 @@
+ 	if (grc)
+ 		grc->lock();
+ #endif
++#ifdef HAVE_HISTB
++	if (fb->SetMode(xres, yres, bpp) < 0)
++	{
++		if (m_pixmap) return;
++		eFatal("[gFBDC] cannot initialize native HiSTB OSD geometry");
++		return;
++	}
++#else
+ 	fb->SetMode(xres, yres, bpp);
+-#ifdef HAVE_HISTB
+-	// DRM fbdev can retain the native mode after rejecting the skin's mode.
+-	// Never describe or allocate surfaces using dimensions the driver rejected.
+-	fb->getMode(xres, yres, bpp);
+ #endif
+ 
+ 	unsigned char *base_addr = fb->lfb;
+@@ -504,7 +507,7 @@
+ 
+ 	eDebug("[gFBDC] resolution: %d x %d x %d (stride: %d) pages: %d", surface.x, surface.y, surface.bpp, fb->Stride(), fb->getNumPages());
+ 
+-#ifndef CONFIG_ION
++#if !defined(CONFIG_ION) && !defined(HAVE_HISTB)
+ 	/* accel is already set in fb.cpp */
+ 	eDebug("[gFBDC] %dkB available for acceleration surfaces.", (fb->Available() - fb_size)/1024);
+ 	if (gAccel::getInstance())
+--- a/lib/python/Components/AVSwitch.py
++++ b/lib/python/Components/AVSwitch.py
+@@ -12,6 +12,7 @@
+ MODULE_NAME = __name__.split(".")[-1]
+ AMLOGIC = BoxInfo.getItem("AmlogicFamily")
+ MACHINEBUILD = BoxInfo.getItem("machinebuild")
++HISTB = BoxInfo.getItem("platform") == "hi3798cv200"
+ 
+ config.av = ConfigSubsection()
+ config.av.edid_override = ConfigYesNo(default=False)
+@@ -902,6 +903,34 @@
+ 	else:
+ 		config.av.scaler_sharpness = NoSave(ConfigNothing())
+ 	avSwitch.setConfiguredMode()
++
++
++class VideoModeConfig(ConfigSubDict):
++	# Keep saved selections for disconnected outputs without advertising them as choices.
++	def __init__(self):
++		ConfigSubDict.__init__(self)
++		self.inactive = {}
++
++	def updateChoices(self, choices):
++		for key in list(self):
++			if key not in choices:
++				self.inactive[key] = self.pop(key)
++		for key, values in choices.items():
++			if key not in self:
++				if key in self.inactive:
++					dict.__setitem__(self, key, self.inactive.pop(key))
++				else:
++					self[key] = ConfigSelection(choices=values)
++			self[key].setChoices(values)
++
++	def getSavedValue(self):
++		values = {key: value for key, value in self.stored_values.items() if key not in self and key not in self.inactive}
++		values.update({key: item.saved_value for key, item in self.inactive.items() if item.saved_value is not None})
++		values.update(ConfigSubDict.getSavedValue(self))
++		return values
++
++	savedValue = property(getSavedValue, ConfigSubDict.setSavedValue)
++	saved_value = property(getSavedValue, ConfigSubDict.setSavedValue)
+ 
+ 
+ class AVSwitchBase:
+@@ -999,6 +1028,8 @@
+ 		"Multi"
+ 	]
+ 	modes["HDMI"] = ["720p", "1080p", "smpte", "2160p30", "2160p", "1080i", "576p", "576i", "480p", "480i"]
++	if HISTB:
++		modes["HDMI"].remove("2160p30")  # A raw 30 Hz timing, not a second UHD resolution.
+ 	modes["YPbPr"] = modes["HDMI"]
+ 	if BoxInfo.getItem("scartyuv", False):
+ 		modes["Scart-YPbPr"] = modes["HDMI"]
+@@ -1024,6 +1055,7 @@
+ 		self.on_hotplug = CList()
+ 		self.current_mode = None
+ 		self.current_port = None
++		self.mode_apply_failed = False
+ 		print(f"[AVSwitch] getAvailableModes: '{eAVControl.getInstance().getAvailableModes()}'.")
+ 		self.is24hzAvailable()
+ 		self.readPreferredModes()
+@@ -1038,7 +1070,14 @@
+ 
+ 	def readPreferredModes(self, saveMode=False, readOnly=False):
+ 		modes = ""
+-		if config.av.edid_override.value is False:
++		if HISTB:
++			# One or two real timings are valid capabilities, not a driver failure.
++			# Never broaden them or bypass the sink when EDID is unavailable.
++			modes = eAVControl.getInstance().getPreferredModes(1)
++			self.modes_preferred = list(dict.fromkeys(modes.split()))
++			if saveMode:
++				return self.modes_preferred[:]
++		elif config.av.edid_override.value is False:
+ 			modes = eAVControl.getInstance().getPreferredModes(1)
+ 			if saveMode:
+ 				modes = modes.split()
+@@ -1047,10 +1086,10 @@
+ 			print(f"[AVSwitch] getPreferredModes: '{modes}'.")
+ 			seen = set()
+ 			self.modes_preferred = [m for m in modes.split() if 'x' not in m and not (m in seen or seen.add(m))]  # Remove duplicates and modes with 'x' in the name, which are not real modes.
+-		if len(modes) < 2:
++		if not HISTB and len(modes) < 2:
+ 			self.modes_preferred = self.readAvailableModes()
+ 			print(f"[AVSwitch] Used default modes: {self.modes_preferred}.")
+-		if len(self.modes_preferred) <= 2:
++		if not HISTB and len(self.modes_preferred) <= 2:
+ 			print(f"[AVSwitch] Preferend modes not okay, possible driver failer, length={len(self.modes_preferred)}.")
+ 			self.modes_preferred = self.readAvailableModes()
+ 		if readOnly:
+@@ -1082,42 +1121,64 @@
+ 
+ 		return self.axis.get(mode, self.axis["720p"])
+ 
++	def migrateLegacyUhdConfig(self):
++		# Migrate the saved baseline before ConfigSelection validates its choices, so
++		# cancel/load cannot resurrect the removed group or discard its refresh rate.
++		saved = config.av.saved_value
++		for modeName, rateName in (("videomode", "videorate"),) + tuple(
++			(f"autores_mode_{kind}", f"autores_rate_{kind}") for kind in ("sd", "hd", "fhd", "uhd")
++		):
++			modes = saved.get(modeName, {})
++			rates = saved.get(rateName, {})
++			legacyRate = rates.pop("2160p30", "25Hz")
++			if "2160p30" in modes.values():
++				for port in modes:
++					if modes[port] == "2160p30":
++						modes[port] = "2160p"
++				# HiSTB applied the first cadence slot of legacy multi/auto: 25 Hz.
++				# Do not reinterpret those settings as the canonical 50/60 Hz pair.
++				rates["2160p"] = "25Hz" if legacyRate in ("multi", "auto") else legacyRate
++				saved[rateName] = rates
++
+ 	def createConfig(self, *args):
+-		config.av.videomode = ConfigSubDict()
+-		config.av.autores_mode_sd = ConfigSubDict()
+-		config.av.autores_mode_hd = ConfigSubDict()
+-		config.av.autores_mode_fhd = ConfigSubDict()
+-		config.av.autores_mode_uhd = ConfigSubDict()
+-		config.av.videorate = ConfigSubDict()
+-		config.av.autores_rate_sd = ConfigSubDict()
+-		config.av.autores_rate_hd = ConfigSubDict()
+-		config.av.autores_rate_fhd = ConfigSubDict()
+-		config.av.autores_rate_uhd = ConfigSubDict()
++		modeNames = ("videomode", "autores_mode_sd", "autores_mode_hd", "autores_mode_fhd", "autores_mode_uhd")
++		rateNames = ("videorate", "autores_rate_sd", "autores_rate_hd", "autores_rate_fhd", "autores_rate_uhd")
++		if HISTB:
++			if not hasattr(config.av, "videomode"):
++				self.migrateLegacyUhdConfig()
++			for name in modeNames + rateNames:
++				if not hasattr(config.av, name):
++					setattr(config.av, name, VideoModeConfig())
++		else:
++			for name in modeNames + rateNames:
++				setattr(config.av, name, ConfigSubDict())
+ 		portList = []  # Create list of output ports.
++		modeChoices = {}
++		rateChoices = {}
+ 		for port in self.getPortList():
+ 			if "HDMI" in port:
+ 				portList.insert(0, (port, port))
+ 			else:
+ 				portList.append((port, port))
+ 			modes = self.getModeList(port)
+-			if len(modes):
+-				config.av.videomode[port] = ConfigSelection(choices=[mode for (mode, rates) in modes])
+-				config.av.autores_mode_sd[port] = ConfigSelection(choices=[mode for (mode, rates) in modes])
+-				config.av.autores_mode_hd[port] = ConfigSelection(choices=[mode for (mode, rates) in modes])
+-				config.av.autores_mode_fhd[port] = ConfigSelection(choices=[mode for (mode, rates) in modes])
+-				config.av.autores_mode_uhd[port] = ConfigSelection(choices=[mode for (mode, rates) in modes])
+-			for (mode, rates) in modes:
+-				rateList = []
+-				for rate in rates:
+-					if rate == "auto" and not BoxInfo.getItem("have24hz"):
+-						continue
+-					rateList.append((rate, rate))
+-				config.av.videorate[mode] = ConfigSelection(choices=rateList)
+-				config.av.autores_rate_sd[mode] = ConfigSelection(choices=rateList)
+-				config.av.autores_rate_hd[mode] = ConfigSelection(choices=rateList)
+-				config.av.autores_rate_fhd[mode] = ConfigSelection(choices=rateList)
+-				config.av.autores_rate_uhd[mode] = ConfigSelection(choices=rateList)
+-		config.av.videoport = ConfigSelection(choices=portList)
++			if modes:
++				modeChoices[port] = [mode for mode, rates in modes]
++			for mode, rates in modes:
++				rateChoices[mode] = [(rate, rate) for rate in rates]
++		for names, choices in ((modeNames, modeChoices), (rateNames, rateChoices)):
++			for name in names:
++				settings = getattr(config.av, name)
++				if HISTB:
++					settings.updateChoices(choices)
++				else:
++					for key, values in choices.items():
++						settings[key] = ConfigSelection(choices=values)
++		if HISTB and hasattr(config.av, "videoport"):
++			config.av.videoport.setChoices(portList)
++		else:
++			config.av.videoport = ConfigSelection(choices=portList)
++		if HISTB and hasattr(config.av, "aspectswitch"):
++			return
+ 		config.av.aspectswitch = ConfigSubsection()
+ 		config.av.aspectswitch.enabled = ConfigYesNo(default=False)
+ 		defaults = (  # The preset values for the offset heights.
+@@ -1172,7 +1233,7 @@
+ 		results = []
+ 		availableModes = self.readAvailableModes()
+ 		for mode in self.modes.get(port, []):
+-			rates = [rate for rate in self.rates[mode] if self.isModeAvailable(port, mode, rate, availableModes)]  # List all rates which are completely valid.
++			rates = [rate for rate in self.rates[mode] if (rate != "auto" or BoxInfo.getItem("have24hz")) and self.isModeAvailable(port, mode, rate, availableModes)]  # List all rates which are completely valid.
+ 			if len(rates):  # If at least one rate is OK then add this mode.
+ 				results.append((mode, rates))
+ 		return results
+@@ -1226,7 +1287,17 @@
+ 		eAVControl.getInstance().setInput(input, 1)
+ 
+ 	def setVideoModeDirect(self, mode):
+-		eAVControl.getInstance().setVideoMode(mode)
++		avControl = eAVControl.getInstance()
++		previous = avControl.getVideoMode("") if HISTB else None
++		avControl.setVideoMode(mode)
++		actual = avControl.getVideoMode("") if HISTB else mode
++		self.mode_apply_failed = actual != mode
++		if self.mode_apply_failed:
++			print(f"[AVSwitch] Requested '{mode}', KMS reports '{actual}'; not saving this selection.")
++			if previous and actual != previous:
++				avControl.setVideoMode(previous)
++				print(f"[AVSwitch] Rollback KMS readback: '{avControl.getVideoMode('')}'.")
++		return not self.mode_apply_failed
+ 
+ 	def setMode(self, port, mode, rate, force=None):
+ 		print(f"[AVSwitch] Setting mode for port '{port}', mode '{mode}', rate '{rate}'.")
+@@ -1243,7 +1314,14 @@
+ 			mode24 = mode60
+ 			if force == 50:
+ 				mode24 = mode50
+-		eAVControl.getInstance().setVideoModeMulti(mode50, mode60, mode24, 1)
++		if HISTB:
++			# KMS applies one timing, not three procfs rate slots. In particular,
++			# 25/30 Hz dictionary entries must reach the real modeset unchanged.
++			if not self.setVideoModeDirect(mode50):
++				return False
++		else:
++			eAVControl.getInstance().setVideoModeMulti(mode50, mode60, mode24, 1)
++			self.mode_apply_failed = False
+ 		if eAVControl.getInstance().hasVideoAxis():
+ 			limits = [int(x) for x in eAVControl.getInstance().getVideoAxis(mode).split()]
+ 			config.osd.dst_left.setChoices(default=limits[0], first=limits[0] - 255, last=limits[0] + 255)
+@@ -1254,6 +1332,7 @@
+ 		self.setColorFormat(config.av.colorformat.value)
+ 		self.current_mode = mode
+ 		self.current_port = port
++		return True
+ 
+ 	def setPolicy43(self, configElement):
+ 		eAVControl.getInstance().setPolicy43(configElement.value, 1)
+@@ -1265,6 +1344,10 @@
+ 		eAVControl.getInstance().setWSS(configElement.value, 1)
+ 
+ 	def saveMode(self, port, mode, rate):
++		if HISTB and (port not in self.modes or not any(mode == candidate and rate in rates for candidate, rates in self.getModeList(port))):
++			return False
++		if HISTB and not self.setMode(port, mode, rate):
++			return False
+ 		config.av.videoport.value = port
+ 		config.av.videoport.save()
+ 		if port in config.av.videomode:
+@@ -1273,6 +1356,7 @@
+ 		if mode in config.av.videorate:
+ 			config.av.videorate[mode].value = rate
+ 			config.av.videorate[mode].save()
++		return True
+ 
+ 
+ # This is a dummy class to stop the constant re-instantiation of the AVSwitchBase class!
+@@ -1304,6 +1388,9 @@
+ def InitiVideomodeHotplug(**kwargs):
+ 	global hotplug
+ 	hotplug = VideomodeHotplug()
++	if HISTB:
++		from Components.HistbVideoHotplug import HistbVideoHotplug
++		hotplug.monitor = HistbVideoHotplug(avSwitch)
+ 
+ 
+ class VideomodeHotplug:
+@@ -1319,6 +1406,8 @@
+ 	def hotplug(self, what):
+ 		print(f"[AVSwitch] Hot-plug detected on port '{what}'.")
+ 		port = config.av.videoport.value
++		if port not in config.av.videomode:
++			return  # A disconnected sink has no selectable modes.
+ 		mode = config.av.videomode[port].value
+ 		rate = config.av.videorate[mode].value
+ 		availableModes = avSwitch.readAvailableModes()
+--- a/lib/python/Screens/VideoMode.py
++++ b/lib/python/Screens/VideoMode.py
+@@ -53,7 +53,7 @@
+ 		items = [
+ 			(_("Video output"), config.av.videoport, _("Configures which video output connector will be used."))
+ 		]
+-		if port in ("HDMI", "YPbPr", "Scart-YPbPr") and not getAutoresPluginEnabled():
++		if port in config.av.videomode and port in ("HDMI", "YPbPr", "Scart-YPbPr") and not getAutoresPluginEnabled():
+ 			modes = avSwitch.readAvailableModes()
+ 			items.append((_("Automatic resolution"), config.av.autores, _("If enabled the output resolution of the receiver will try to match the resolution of the video contents resolution.")))
+ 			if config.av.autores.value in ("all", "hd"):
+@@ -122,7 +122,7 @@
+ 						items.append((_("%sShow 1080i as 1080p") % self.prevFhd, config.av.autores_1080i_deinterlace, _("Use Deinterlacing for 1080i Videosignal?"), "check_fhd"))
+ 					elif "1080p" not in modes and "1080p50" not in modes:
+ 						config.av.autores_1080i_deinterlace.value = False
+-				if "2160p" in modes or "2160p30" in modes:
++				if any(mode.startswith("2160p") for mode in config.av.videomode[port].choices):
+ 					self.getVerifyVideomode(config.av.autores_mode_uhd, config.av.autores_rate_uhd)
+ 					items.extend((
+ 						(pgettext(_("Video output mode for UHD"), _("%sMode for UHD (up to 2160p)") % self.prevUhd), config.av.autores_mode_uhd[port], _("This option configures the video output mode (or resolution)."), "check_uhd"),
+@@ -175,7 +175,8 @@
+ 				if config.av.aspectswitch.enabled.value:
+ 					for aspect in range(5):
+ 						items.append((f" -> {avSwitch.ASPECT_SWITCH_MSG[aspect]}", config.av.aspectswitch.offsets[str(aspect)]))
+-			items.append((_("Allow unsupported modes"), config.av.edid_override, _("This option allows you to use all HDMI Modes.")))
++			if BoxInfo.getItem("platform") != "hi3798cv200":
++				items.append((_("Allow unsupported modes"), config.av.edid_override, _("This option allows you to use all HDMI Modes.")))
+ 		if port == "Scart":
+ 			items.append((_("Color format"), config.av.colorformat, _("Configure which color format should be used on the SCART output.")))
+ 			if level >= 1:
+@@ -198,6 +199,17 @@
+ 			setrate[configMode].value = configRate
+ 
+ 	def confirm(self, confirmed):
++		if config.av.videoport.value not in config.av.videomode:
++			self.createSetup()
++			return
++		if confirmed and BoxInfo.getItem("platform") == "hi3798cv200":
++			port = config.av.videoport.value
++			mode = config.av.videomode[port].value
++			rate = config.av.videorate[mode].value
++			if avSwitch.mode_apply_failed or (config.av.autores.value == "disabled" and
++				eAVControl.getInstance().getVideoMode("") not in avSwitch.rates[mode][rate].values()):
++				confirmed = False
++				self.session.open(MessageBox, _("The requested video mode was not applied. The previous settings have been restored."), MessageBox.TYPE_ERROR)
+ 		if not confirmed:
+ 			if self.resetMode == 1:
+ 				config.av.videoport.value = self.lastGood[0]
+@@ -231,6 +243,9 @@
+ 	def grabLastGoodMode(self):
+ 		self.resetMode = 0
+ 		port = config.av.videoport.value
++		if port not in config.av.videomode:
++			self.lastGood = None
++			return
+ 		mode = config.av.videomode[port].value
+ 		rate = config.av.videorate[mode].value
+ 		self.lastGood = (port, mode, rate)
+@@ -251,6 +266,11 @@
+ 
+ 	def keySave(self):
+ 		port = config.av.videoport.value
++		if port not in config.av.videomode:
++			Setup.keySave(self)
++			return
++		if self.lastGood is None:
++			self.grabLastGoodMode()
+ 		mode = config.av.videomode[port].value
+ 		rate = config.av.videorate[mode].value
+ 		autoresSd = config.av.autores_sd.value
+@@ -278,6 +298,10 @@
+ 			self.resetMode = 0
+ 			Setup.keySave(self)
+ 			return
++		if avSwitch.mode_apply_failed:
++			self.confirm(False)
++			self.session.open(MessageBox, _("The requested video mode was rejected by the display hardware. The previous settings have been restored."), MessageBox.TYPE_ERROR)
++			return
+ 		if BoxInfo.getItem("machinebuild") == "gbquad4kpro" and mode.startswith("2160p"):  # Hack for GB QUAD 4K Pro!
+ 			config.av.hdmicolordepth.value = "10bit"
+ 			config.av.hdmicolordepth.save()
+@@ -287,7 +311,7 @@
+ 		return eAVControl.getInstance().getVideoMode("") or None
+ 
+ 	def changedEntry(self):
+-		if config.av.autores_preview.value:
++		if config.av.autores_preview.value and config.av.videoport.value in config.av.videomode:
+ 			ConfigListScreen.changedEntry(self)
+ 			cur = self["config"].getCurrent()
+ 			cur = cur and len(cur) > 3 and cur[3]
+@@ -499,6 +523,8 @@
+ 	def VideoChangeDetect(self):
+ 		# Info: Auto resolution preview or save settings call this function with session = None / ~338, ~374.
+ 		global resolutionlabel
++		if config.av.videoport.value not in config.av.videomode:
++			return  # No sink: there is no configured timing to derive an output from.
+ 		avControl = eAVControl.getInstance()
+ 		configPort, configMode, configRes, configPol, configRate = self.getConfigVideomode(config.av.videomode, config.av.videorate)
+ 		configMode = configMode.replace("p30", "p")
+@@ -785,9 +811,11 @@
+ 					elif writeMode in ("2160p24", "2160p30", "2160p60"):
+ 						writeMode = "2160p"
+ 				if writeMode in values:
+-					avSwitch.setVideoModeDirect(writeMode)
+-					print(f"[VideoMode] setMode - port: {configPort}, mode: {writeMode} (autoresTyp: '{autorestyp}')")
+-					resolutionlabel["restxt"].setText(_("Video mode: %s") % writeMode)
++					if avSwitch.setVideoModeDirect(writeMode):
++						print(f"[VideoMode] setMode - port: {configPort}, mode: {writeMode} (autoresTyp: '{autorestyp}')")
++						resolutionlabel["restxt"].setText(_("Video mode: %s") % writeMode)
++					else:
++						resolutionlabel["restxt"].setText(_("Video mode: %s not available") % writeMode)
+ 				else:
+ 					print(f"[VideoMode] setMode - port: {configPort}, mode: {writeMode} is not available")
+ 					resolutionlabel["restxt"].setText(_("Video mode: %s not available") % writeMode)
+@@ -809,7 +837,9 @@
+ def manualResolution(session):  # Ad hoc video mode selection from the extensions menu.
+ 	def manualResolutionCallback(choice):
+ 		if choice and choice[1] != oldMode:
+-			avSwitch.setVideoModeDirect(choice[1])
++			if not avSwitch.setVideoModeDirect(choice[1]):
++				session.open(MessageBox, _("The requested video mode was rejected by the display hardware."), MessageBox.TYPE_ERROR)
++				return
+ 			session.openWithCallback(confirmCallback, MessageBox, _("Is this video mode ok?"), MessageBox.TYPE_YESNO, timeout=10, default=False)
+ 
+ 	def confirmCallback(answer):
+--- a/lib/python/Screens/WizardVideo.py
++++ b/lib/python/Screens/WizardVideo.py
+@@ -85,8 +85,6 @@
+ 		for modes in avSwitch.getModeList(self.port):
+ 			if modes[0] == mode:
+ 				for rate in modes[1]:
+-					if rate == "auto" and not BoxInfo.getItem("have24hz"):
+-						continue
+ 					if self.port == "DVI-PC":
+ 						# print("[WizardVideo] listModes DEBUG: rate='%s'." % rate)
+ 						if rate == "640x480":
+@@ -131,7 +129,8 @@
+ 			return False
+ 		# listRates already prefers multi, but only if all required rates are available.
+ 		self.rate = rates[0][0]
+-		self.setVideoMode(self.port, mode, self.rate)
++		if not self.setVideoMode(self.port, mode, self.rate):
++			return False
+ 
+ 		if BoxInfo.getItem("machinebuild") == "gbquad4kpro" and mode.startswith("2160p"):  # Hack for GB QUAD 4K Pro
+ 			config.av.hdmicolordepth.value = "10bit"
+@@ -149,25 +148,24 @@
+ 
+ 	def rateSelect(self, rate):
+ 		if any(item[0] == rate for item in self.listRates()):
+-			self.setVideoMode(self.port, self.mode, rate)
+-			return True
++			return self.setVideoMode(self.port, self.mode, rate)
+ 		return False
+ 
+ 	def setVideoMode(self, port, mode, rate):
+ 		# Selection changes, OK and entry into the next step can request the same mode.
+ 		videoMode = (port, mode, rate)
+ 		if videoMode != self.lastVideoMode:
+-			avSwitch.setMode(port=port, mode=mode, rate=rate)
++			if not avSwitch.setMode(port=port, mode=mode, rate=rate):
++				return False
+ 			self.lastVideoMode = videoMode
++		return True
+ 
+ 	def keyNumberGlobal(self, number):
+ 		if number in (1, 2, 3):
+-			if number == 1:
+-				avSwitch.saveMode("HDMI", "720p", "multi")
+-			elif number == 2:
+-				avSwitch.saveMode("HDMI", "1080i", "multi")
+-			elif number == 3:
+-				avSwitch.saveMode("Scart", "Multi", "multi")
++			port, mode, rate = {1: ("HDMI", "720p", "multi"), 2: ("HDMI", "1080i", "multi"), 3: ("Scart", "Multi", "multi")}[number]
++			if not avSwitch.saveMode(port, mode, rate):
++				return
++			configfile.save()
+ 			avSwitch.setConfiguredMode()
+ 			self.close()
+ 		Wizard.keyNumberGlobal(self, number)
+@@ -179,7 +177,10 @@
+ 		configfile.save()
+ 
+ 	def saveWizardChanges(self):  # Called by wizardvideo.xml.
+-		avSwitch.saveMode(self.port, self.mode, self.rate)
++		if not avSwitch.saveMode(self.port, self.mode, self.rate):
++			from Screens.MessageBox import MessageBox
++			self.session.open(MessageBox, _("The requested video mode was not applied. Settings were not saved."), MessageBox.TYPE_ERROR)
++			return False
+ 		# config.misc.wizardVideoEnabled.value = 0
+ 		# config.misc.wizardVideoEnabled.save()
+ 		config.misc.videowizardenabled.value = 0
+--- a/lib/python/Screens/WizardStart.py
++++ b/lib/python/Screens/WizardStart.py
+@@ -478,7 +478,14 @@
+ 			elif "1080p" in preferred:
+ 				self.mode = "1080p"
+ 
+-		self.setMode()
++		if BoxInfo.getItem("platform") == "hi3798cv200":
++			# Do not overwrite a saved KMS timing or probe an absent sink.
++			if "HDMI" in config.av.videomode:
++				self.mode = config.av.videomode["HDMI"].value
++				avSwitch.setConfiguredMode()
++				preferred = [self.mode]
++		else:
++			self.setMode()
+ 
+ 		if not preferred:
+ 			ports = [port for port in avSwitch.getPortList() if avSwitch.isPortUsed(port)]
+@@ -487,6 +494,8 @@
+ 				print("[WizardLanguage] DEBUG start resolutionTimer")
+ 
+ 	def setMode(self):
++		if BoxInfo.getItem("platform") == "hi3798cv200" and "HDMI" not in config.av.videomode:
++			return
+ 		print(f"[WizardLanguage] DEBUG setMode {self.mode}")
+ 		if self.mode in ("720p", "1080p") and not BoxInfo.getItem("AmlogicFamily"):
+ 			rate = "multi"
+@@ -505,8 +514,6 @@
+ 		for modes in avSwitch.getModeList("HDMI"):
+ 			if modes[0] == self.mode:
+ 				for rate in modes[1]:
+-					if rate == "auto" and not BoxInfo.getItem("have24hz"):
+-						continue
+ 					rates.append((rate, rate))
+ 		rates.sort(key=sortKey)
+ 		return rates[0][0]

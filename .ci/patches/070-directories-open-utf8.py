@@ -9,16 +9,14 @@ replacements = [
     ('with open(filename) as fd:', 'with open(filename, encoding="utf-8") as fd:'),
     ('with open(filename, "w") as fd:', 'with open(filename, "w", encoding="utf-8") as fd:'),
 ]
-count = 0
-for old, new in replacements:
-    count += s.count(old)
-    s = s.replace(old, new)
-if count < 5:
-    if 'encoding="utf-8") as fd:' in s:
-        print('Directories.py already pinned to utf-8')
-    else:
-        raise SystemExit(f'Directories.py open anchors: expected >=5, got {count} - upstream changed, review needed')
-else:
+count = sum(s.count(old) for old, new in replacements)
+applied = sum(s.count(new) for old, new in replacements)
+if count == 0 and applied >= 5:
+    print('Directories.py already pinned to utf-8')
+elif count >= 5:
+    for old, new in replacements:
+        s = s.replace(old, new)
     open(p, 'w').write(s)
     print(f'Directories.py: {count} open() calls pinned to utf-8')
-
+else:
+    raise SystemExit(f'Directories.py open anchors: expected >=5, got {count} - upstream changed, review needed')

@@ -24,4 +24,3 @@ else:
     raise SystemExit('db.cpp missing-bouquet anchor not found - upstream changed, review needed')
 open(p, 'w').write(s)
 print('db.cpp dangling bouquet entry fixed')
-

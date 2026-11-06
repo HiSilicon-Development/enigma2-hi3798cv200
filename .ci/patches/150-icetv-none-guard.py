@@ -27,4 +27,3 @@ else:
     raise SystemExit('IceTV plugin.py gotRecordEvent anchor not found - upstream changed, review needed')
 open(p, 'w').write(s)
 print('IceTV plugin.py gotRecordEvent None-guard patched')
-
