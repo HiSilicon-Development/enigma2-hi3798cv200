@@ -29,7 +29,9 @@ SOURCES = {
     "skindefault": ("openatv/oe-alliance-e2-skindefault", "HEAD"),
     "tuxbox-common": ("oe-alliance/oe-alliance-tuxbox-common", "HEAD"),
     "weatherinfo": ("openatv/WeatherInfo", "HEAD"),
-    "oe-alliance-core": ("oe-alliance/oe-alliance-core", "master"),
+    # oe-alliance-core has version branches only (3.4 ... 6.0); 'master' does
+    # not exist, so follow the repository default branch.
+    "oe-alliance-core": ("oe-alliance/oe-alliance-core", "HEAD"),
     "metrixhd": ("openatv/MetrixHD", "HEAD"),
     "openwebif": ("oe-alliance/OpenWebif", "HEAD"),
 }
