@@ -21,7 +21,7 @@ CI 使用 `ubuntu-24.04-arm` 原生 runner，分别在 Debian 12 / 13 容器中�
 - `linux-headers-6.12.112-dvbip-1002_6.12.112-1_arm64.deb`（header 包命名与版本对齐参考）
 - `update-1002.tar.gz`（刷机包）
 
-触发方式：手动 `workflow_dispatch`、推送对应 workflow 文件、每周定时跟踪上游。
+触发方式：手动 `workflow_dispatch`、推送对应 workflow 文件、每周定时构建；Enigma2 默认基准固定，升级上游需显式选择并重放验证。
 
 ## 应用依赖与源码版本
 
@@ -33,6 +33,8 @@ CI 使用 `ubuntu-24.04-arm` 原生 runner，分别在 Debian 12 / 13 容器中�
 - `source_refs` 工作流输入接受仓库名到分支、tag 或完整 commit 的 JSON 映射。
   每次构建记录解析后的 `sources.lock.json`；将其作为下次输入可固定源码版本。
   它不锁定 APT 包或 Python wheels。
+- Enigma2 默认固定到已整合验证的上游 `a6db04f56fd3314f9c3c30df639a4a394b6332c1`；
+  `source_refs.enigma2` 和已有 `sources.lock.json` 仍可显式覆盖。其他依赖的默认选择不变。
 
 ## 盒子端安装
 
