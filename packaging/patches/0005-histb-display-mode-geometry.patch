@@ -412,7 +412,7 @@
 @@ -1172,7 +1233,7 @@
  		results = []
  		availableModes = self.readAvailableModes()
- 		for mode in self.modes[port]:
+ 		for mode in self.modes.get(port, []):
 -			rates = [rate for rate in self.rates[mode] if self.isModeAvailable(port, mode, rate, availableModes)]  # List all rates which are completely valid.
 +			rates = [rate for rate in self.rates[mode] if (rate != "auto" or BoxInfo.getItem("have24hz")) and self.isModeAvailable(port, mode, rate, availableModes)]  # List all rates which are completely valid.
  			if len(rates):  # If at least one rate is OK then add this mode.
