@@ -43,3 +43,19 @@ driver.
 The HiSTB arm64 defconfigs embed the image through CONFIG_EXTRA_FIRMWARE.
 The histb-vdec driver requests it as hisilicon/histb-avsp.bin and checks
 the exact size before copying it to a 128-byte-aligned coherent buffer.
+
+Reproducing the packaged images
+------------------------------
+
+The matching kernel source provides firmware/hisilicon/Makefile and the
+generate-avsp.py, generate-h264-cabac.py and generate-hevc-cabac.py tools.
+From a kernel checkout, generate the three payloads into a separate directory:
+
+  make -f firmware/hisilicon/Makefile OUT=/path/to/generated-firmware PYTHON=python3
+
+Compare the generated names, sizes and SHA-256 digests with this file and
+README.cabac before replacing the packaged copies. The Enigma2 application
+package does not install these kernel-owned payloads.
+
+Generation and byte correspondence document technical provenance; they do
+not establish or replace the redistribution terms of the source materials.
