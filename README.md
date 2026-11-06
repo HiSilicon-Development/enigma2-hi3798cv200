@@ -5,6 +5,11 @@ HiSilicon **Hi3798CV200 / DVBIP** 的 Debian arm64 应用构建工程。HiSTB �
 [manhere/enigma2-hi3798cv200](https://github.com/manhere/enigma2-hi3798cv200) 的工作；
 本工程在官方上游源码上应用维护补丁，不以移植分支替代官方源码来源。
 
+`enigma2-hi3798cv200` 是应用适配的维护与构建入口：OpenATV、OpenWebif 和默认皮肤的
+源码获取、平台适配、资源组装及 Debian 打包规则均保存在本仓库。独立发布的三个源码
+仓库是某次选定上游 HEAD 加上本仓库适配结果的固定快照，用于审查和对应源码发布，
+不是持续合并新上游的分支，也不是本工作流的源码输入。后续适配只在本仓库维护。
+
 应用包不安装或替换内核、内核模块及 HiVXE FFmpeg。构建与运行需要配套的内核 UAPI、
 FFmpeg 私有 request ABI 和设备支持，不能仅凭包名或共享库 SONAME 判断兼容。
 CI 使用 `ubuntu-24.04-arm` 原生 runner，分别在 Debian 12 / 13 容器中构建；两个发行版的
@@ -28,15 +33,15 @@ CI 使用 `ubuntu-24.04-arm` 原生 runner，分别在 Debian 12 / 13 容器中�
 
 ### 版本选择与可复现边界
 
-- Enigma2 默认从官方 `openatv/enigma2` 的 `master` 获取源码，不再以单个硬编码 SHA
-  作为默认版本。浮动分支意味着不同时间的构建可能解析到不同 commit，不意味着新上游已通过实机验收。
+- Enigma2 默认从官方 `openatv/enigma2` 的 `master` 获取源码；OpenWebif 和
+  skindefault 默认解析各自官方仓库的 `HEAD`。不以某次源码快照的 commit 作为永久默认。
+  浮动输入意味着不同时间的构建可能解析到不同 commit，不意味着新上游已通过实机验收。
 - `source_refs` 工作流输入接受仓库名到分支、tag 或完整 commit 的 JSON 映射。
-  `source_refs.enigma2` 可显式选择 Enigma2 版本；每次构建输出解析后的
-  `sources.lock.json`，应随成品保存。将锁文件作为后续输入可固定所选源码版本。
-  该文件不锁定 APT 包或 Python wheels，也不证明所有构建环境完全可复现。
-- OpenWebif 仍以 `b511d277098de5e0f0a16a2cd4e55510874e19df` 为默认补丁基线，
-  这是独立的补丁兼容性选择，不是“所有依赖自动升级”的承诺。改变其 ref 时必须同步适配
-  `packaging/openwebif-histb.patch`，并重建维护的桌面和手机资源。
+  `enigma2`、`openwebif` 和 `skindefault` 均可单独选择；每次构建输出解析后的
+  `sources.lock.json`，应与打包仓库版本及成品一起保存。复现某次发布时使用该锁文件，
+  不重新选择更新的上游。该文件不锁定 APT 包或 Python wheels。
+- 对应源码快照固定在该次解析出的上游基准，并完整包含当次适配；发布快照后不自动
+  拉入后续上游。补丁更新及其与新上游的兼容性检查仍由本仓库负责。
 - 上游上下文变化时必须刷新补丁并重新验证；流水线在源码适配或补丁应用失败时中止，
   不静默跳过不适用的补丁。不能把默认 `master` 与旧补丁曾通过等同于任意新上游均兼容。
 
@@ -81,6 +86,11 @@ CI 使用 `ubuntu-24.04-arm` 原生 runner，分别在 Debian 12 / 13 容器中�
 盒子上的网页文件。保存调用真实 `configfile.save()`，失败不伪造成功或执行应用回调；
 取消保留正确的原值与后端状态。桌面和手机按请求选择模板，不共用全局 mobile 状态。
 截图请求和页面资源有独立生命周期，后端错误按实际 HTTP 状态展示，而不作为图片返回。
+
+skindefault 的适配目前属于资源组装：安装完整的 fallback XML、模板、预览、
+`skin_default/` 资源树及配套字体，并保留相对 include 关系和 Debian 字体路径。
+没有仅为产生差异而修改其上游 XML 或图像；对应独立源码快照可以与选定上游 HEAD
+逐字一致。相关安装规则保存在工作流和 `packaging/package-runtime.py`，不是隐藏在构建目录中。
 
 打包器还处理私有 Python 模块的无版本 SONAME、皮肤绝对字体路径及运行库收集，
 并移除冒充 OE 固件镜像的分区 / 刷机元数据。`BOXTYPE` / `MACHINEBUILD` 使用上游

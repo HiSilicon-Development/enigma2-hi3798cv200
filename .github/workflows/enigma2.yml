@@ -234,10 +234,9 @@ jobs:
         run: |
           cd enigma2
           make install DESTDIR=/tmp/e2-staging
-          # skin_default 的图标资源（icons/buttons/extensions 等）不在 enigma2
-          # 主仓库，OE 由独立包 openatv/oe-alliance-e2-skindefault 提供；
-          # 缺失时 Satfinder 锁定图标、CableScan scan-c.png 等全部告警。
-          # 只拷资源目录，不覆盖 enigma2 master 的 skin_default.xml。
+          # Stage the default-skin resource tree. prepare_runtime() also installs
+          # its root fallback XML, templates, preview and fonts from this checkout.
+          # Keep the source identity in the same lock as Enigma2 and OpenWebif.
           python3 "$GITHUB_WORKSPACE/packaging/fetch-source.py" clone skindefault /tmp/skindefault
           mkdir -p /tmp/e2-staging/usr/local/share/enigma2/skin_default
           cp -a /tmp/skindefault/skin_default/. /tmp/e2-staging/usr/local/share/enigma2/skin_default/
