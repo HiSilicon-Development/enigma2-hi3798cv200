@@ -713,8 +713,10 @@ public:
 		const auto *frames = reinterpret_cast<const AVHWFramesContext *>(frame->hw_frames_ctx->data);
 		if (!frames->device_ctx || frames->device_ctx->type != AV_HWDEVICE_TYPE_V4L2REQUEST)
 			return false;
-		const auto *request = reinterpret_cast<const AVV4L2RequestFrameDescriptor *>(frame->data[0]);
-		width = request->coded_width; height = request->coded_height;
+		/* Coded (padded) capture geometry: the hw frames context is sized from
+		 * the negotiated V4L2 G_FMT, i.e. the coded dimensions.  The frame
+		 * descriptor itself only carries drm/wait/deinterlace. */
+		width = frames->width; height = frames->height;
 		if (!width || !height || width > 4096 || height > 2160 ||
 			(width & 3) || (height & 1) || frame->width <= 0 || frame->height <= 0 ||
 			uint32_t(frame->width) > width || uint32_t(frame->height) > height)
