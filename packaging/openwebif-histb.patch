@@ -511,7 +511,7 @@ index 6ba7c445..827bb00a 100644
 -
 -		print(f"[OpenWebif] cancelConfigBatch new value of {path} is {cnf.value}")
 -
-+	if section in ("Time", "time"):
++	if section in ("DateTime", "datetime"):
 +		try:
 +			yield _applyTimeSettings()
 +		except Exception as error:
@@ -560,7 +560,7 @@ index 6ba7c445..827bb00a 100644
 -		except Exception as e:
 -			print(f"[OpenWebif] saveConfigBatch Error for {path}: {e}")
 -			errors.append(f"Error saving '{path}': {str(e)}")
-+			if section in ("Time", "time") or any(path in ("config.misc.SyncTimeUsing", "config.misc.NTPserver", "config.misc.useNTPminutes") for path in keys):
++			if section in ("DateTime", "datetime") or any(path in ("config.misc.SyncTimeUsing", "config.misc.NTPserver", "config.misc.useNTPminutes") for path in keys):
 +				applied = False
 +				applied = yield _applyTimeSettings()
 +			elif section in ("Softcam", "Cardserver"):
