@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <climits>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -10,13 +11,27 @@
 #include <mutex>
 #include <unistd.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <linux/fb.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 #include <drm_fourcc.h>
 #include <lib/base/eerror.h>
 
-/* One DRM file/master per process, shared by AVControl, the UI and decoder.
+/* The CPU canvas owns a separate, non-master DRM file. Its framebuffer ID is
+ * device-global; the connected KMS master can scan out the very same GEM. */
+struct HistbDrmCanvas
+{
+	int fd = -1;
+	uint32_t handle = 0, fb = 0;
+	uint32_t width = 0, height = 0, pitch = 0;
+	uint64_t size = 0;
+	unsigned char *map = nullptr;
+	dev_t device = 0;
+};
+
+/* One KMS file/master per process, shared by AVControl, UI and decoder.
  * dup() preserves DRM-file identity; separately open()ing card0 does not.
  * All KMS commits hold mutex through completion, including page-flip events. */
 struct HistbDrmSession
@@ -24,10 +39,11 @@ struct HistbDrmSession
 	std::mutex mutex;
 	int fd = -1;
 	uint32_t connector = 0, crtc = 0, primary = 0;
-	/* fbdev allocation/stride remain physical; sourceW/H are skin pixels. */
+	/* Backing allocation/stride remain native; sourceW/H are skin pixels. */
 	uint32_t sourceW = 0, sourceH = 0;
 	uint32_t framebufferW = 0, framebufferH = 0, sourcePitch = 0;
 	uint32_t osdFb = 0;
+	HistbDrmCanvas canvas;
 	double refreshPeriodUs = 0.0;
 };
 
@@ -48,6 +64,107 @@ inline HistbDrmSession &histbDrmSession()
 {
 	static HistbDrmSession session;
 	return session;
+}
+
+/* Caller holds session.mutex. Allocate UI memory, not a mode or a sink.
+ * Drop the automatic master before keeping an allocation file open so that
+ * kernel fbdev hotplug can still initialize the first physical output. */
+inline bool histbOsdCreateCanvas()
+{
+	auto &s = histbDrmSession();
+	if (s.canvas.fd >= 0) return false;
+	for (int card = 0; card < 8; ++card)
+	{
+		char path[32];
+		snprintf(path, sizeof(path), "/dev/dri/card%d", card);
+		HistbDrmCanvas canvas;
+		canvas.fd = open(path, O_RDWR | O_CLOEXEC);
+		if (canvas.fd < 0) continue;
+		drmVersionPtr version = drmGetVersion(canvas.fd);
+		bool vdp = version && version->name && !strcmp(version->name, "histb-vdp");
+		if (version) drmFreeVersion(version);
+		struct stat device = {}, connected = {};
+		uint64_t dumb = 0;
+		bool usable = vdp && fstat(canvas.fd, &device) == 0 &&
+			(s.fd < 0 || (fstat(s.fd, &connected) == 0 && connected.st_rdev == device.st_rdev)) &&
+			(!drmIsMaster(canvas.fd) || drmDropMaster(canvas.fd) == 0) &&
+			drmGetCap(canvas.fd, DRM_CAP_DUMB_BUFFER, &dumb) == 0 && dumb;
+		if (!usable) { close(canvas.fd); continue; }
+		struct drm_mode_create_dumb create = {};
+		create.width = 1920; create.height = 1080; create.bpp = 32;
+		if (drmIoctl(canvas.fd, DRM_IOCTL_MODE_CREATE_DUMB, &create) != 0)
+		{
+			eWarning("[histb-drm] cannot allocate offscreen OSD on %s: %s", path, strerror(errno));
+			close(canvas.fd);
+			continue;
+		}
+		canvas.handle = create.handle;
+		canvas.width = create.width; canvas.height = create.height;
+		canvas.pitch = create.pitch; canvas.size = create.size;
+		canvas.device = device.st_rdev;
+		struct drm_mode_map_dumb mapping = {};
+		mapping.handle = canvas.handle;
+		bool ok = canvas.pitch >= uint64_t(canvas.width) * 4 &&
+			canvas.size >= uint64_t(canvas.pitch) * canvas.height && canvas.size <= INT_MAX &&
+			drmIoctl(canvas.fd, DRM_IOCTL_MODE_MAP_DUMB, &mapping) == 0;
+		if (ok)
+		{
+			canvas.map = static_cast<unsigned char *>(mmap(nullptr, canvas.size,
+				PROT_READ | PROT_WRITE, MAP_SHARED, canvas.fd, mapping.offset));
+			if (canvas.map == MAP_FAILED) { canvas.map = nullptr; ok = false; }
+		}
+		if (ok)
+		{
+			uint32_t handles[4] = {canvas.handle, 0, 0, 0};
+			uint32_t pitches[4] = {canvas.pitch, 0, 0, 0}, offsets[4] = {};
+			ok = drmModeAddFB2(canvas.fd, canvas.width, canvas.height, DRM_FORMAT_ARGB8888,
+				handles, pitches, offsets, &canvas.fb, 0) == 0;
+		}
+		if (!ok)
+		{
+			eWarning("[histb-drm] cannot map/register offscreen OSD on %s: %s", path, strerror(errno));
+			if (canvas.map) munmap(canvas.map, canvas.size);
+			struct drm_mode_destroy_dumb destroy = {};
+			destroy.handle = canvas.handle;
+			drmIoctl(canvas.fd, DRM_IOCTL_MODE_DESTROY_DUMB, &destroy);
+			close(canvas.fd);
+			continue;
+		}
+		memset(canvas.map, 0, canvas.size);
+		s.canvas = canvas;
+		s.framebufferW = canvas.width; s.framebufferH = canvas.height; s.sourcePitch = canvas.pitch;
+		s.sourceW = canvas.width; s.sourceH = canvas.height;
+		eDebug("[histb-drm] offscreen ARGB8888 OSD %ux%u stride %u size %llu FB %u on %s (non-master)",
+			canvas.width, canvas.height, canvas.pitch, (unsigned long long)canvas.size, canvas.fb, path);
+		return true;
+	}
+	return false;
+}
+
+inline bool histbOsdReleaseCanvas()
+{
+	auto &s = histbDrmSession();
+	std::lock_guard<std::mutex> lock(s.mutex);
+	auto &canvas = s.canvas;
+	if (canvas.fd < 0) return true;
+	/* RMFB must use the creating file. It synchronously removes scanout
+	 * references; the kernel retains GEM references for any driver-held FB.
+	 * Never unmap/close our ownership if the removal ioctl itself fails. */
+	if (drmModeRmFB(canvas.fd, canvas.fb) != 0)
+	{
+		eWarning("[histb-drm] retaining OSD FB %u and GEM ownership after RMFB failure: %s", canvas.fb, strerror(errno));
+		return false;
+	}
+	if (s.osdFb == canvas.fb) { s.osdFb = 0; s.primary = 0; }
+	munmap(canvas.map, canvas.size);
+	struct drm_mode_destroy_dumb destroy = {};
+	destroy.handle = canvas.handle;
+	if (drmIoctl(canvas.fd, DRM_IOCTL_MODE_DESTROY_DUMB, &destroy) != 0)
+		eWarning("[histb-drm] OSD handle release failed: %s", strerror(errno));
+	close(canvas.fd);
+	canvas = HistbDrmCanvas();
+	s.framebufferW = s.framebufferH = s.sourcePitch = s.sourceW = s.sourceH = 0;
+	return true;
 }
 
 inline uint32_t histbDrmProperty(int fd, uint32_t object, uint32_t type,
@@ -80,12 +197,13 @@ inline int histbDrmOpen(drmModeConnection *connection = nullptr)
 	if (connection) *connection = DRM_MODE_UNKNOWNCONNECTION;
 	if (s.fd >= 0)
 	{
-		if (connection)
-		{
-			drmModeConnectorPtr connector = drmModeGetConnector(s.fd, s.connector);
-			if (connector) { *connection = connector->connection; drmModeFreeConnector(connector); }
-		}
-		return s.fd;
+		drmModeConnectorPtr connector = drmModeGetConnector(s.fd, s.connector);
+		bool usable = connector && connector->connection == DRM_MODE_CONNECTED && connector->count_modes;
+		if (connection && connector) *connection = connector->connection;
+		if (connector) drmModeFreeConnector(connector);
+		/* Keep the connected session's object ownership, but never report
+		 * an old active CRTC as a physical output after unplugging HDMI. */
+		return usable ? s.fd : -1;
 	}
 	bool disconnected = false, otherConnection = false;
 	for (int card = 0; card < 8; ++card)
@@ -94,6 +212,11 @@ inline int histbDrmOpen(drmModeConnection *connection = nullptr)
 		snprintf(path, sizeof(path), "/dev/dri/card%d", card);
 		int fd = open(path, O_RDWR | O_CLOEXEC);
 		if (fd < 0) continue;
+		if (s.canvas.fd >= 0)
+		{
+			struct stat device = {};
+			if (fstat(fd, &device) != 0 || device.st_rdev != s.canvas.device) { close(fd); continue; }
+		}
 		drmModeResPtr res = drmModeGetResources(fd);
 		if (!res) { close(fd); continue; }
 		for (int i = 0; i < res->count_connectors; ++i)
@@ -149,13 +272,15 @@ inline bool histbDrmSameMode(const drmModeModeInfo &a, const drmModeModeInfo &b)
 		a.vsync_end == b.vsync_end && a.vtotal == b.vtotal && a.flags == b.flags && a.vscan == b.vscan;
 }
 
-/* Caller holds mutex. GP0 scales the skin canvas directly from fbdev's GEM.
+/* Caller holds mutex. GP0 scales the skin directly from its real GEM backing.
  * Never disable another graphics input to evade the shared-group constraint,
  * or copy video/OSD pixels to conceal a rejected hardware configuration. */
 inline bool histbDrmSetMode(const drmModeModeInfo &mode)
 {
 	auto &s = histbDrmSession();
 	if (histbDrmOpen() < 0) return false;
+	if (s.canvas.fd >= 0 && (!s.canvas.fb || s.framebufferW != s.canvas.width ||
+		s.framebufferH != s.canvas.height || s.sourcePitch != s.canvas.pitch)) return false;
 	if (!s.framebufferW)
 	{
 		int fb = open("/dev/fb0", O_RDWR | O_CLOEXEC);
@@ -173,23 +298,32 @@ inline bool histbDrmSetMode(const drmModeModeInfo &mode)
 		return false;
 	drmModeCrtcPtr before = drmModeGetCrtc(s.fd, s.crtc);
 	drmModePlaneResPtr planes = drmModeGetPlaneResources(s.fd);
-	if (!before || !before->mode_valid || !planes)
+	if (!before || (!before->mode_valid && s.canvas.fd < 0) || !planes)
 	{
 		if (before) drmModeFreeCrtc(before);
 		if (planes) drmModeFreePlaneResources(planes);
 		return false;
+	}
+	uint32_t crtcMask = 0;
+	drmModeResPtr resources = drmModeGetResources(s.fd);
+	if (resources)
+	{
+		for (int i = 0; i < resources->count_crtcs && i < 32; ++i)
+			if (resources->crtcs[i] == s.crtc) crtcMask = uint32_t(1) << i;
+		drmModeFreeResources(resources);
 	}
 	uint32_t primary = 0, currentFb = 0;
 	for (uint32_t i = 0; i < planes->count_planes; ++i)
 	{
 		drmModePlanePtr p = drmModeGetPlane(s.fd, planes->planes[i]);
 		uint64_t type = 0;
-		if (p && p->crtc_id == s.crtc && p->fb_id &&
+		if (p && ((p->crtc_id == s.crtc && p->fb_id) ||
+			(s.canvas.fd >= 0 && (p->possible_crtcs & crtcMask))) &&
 			histbDrmProperty(s.fd, p->plane_id, DRM_MODE_OBJECT_PLANE, "type", &type) && type == DRM_PLANE_TYPE_PRIMARY)
 		{ primary = p->plane_id; currentFb = p->fb_id; }
 		if (p) drmModeFreePlane(p);
 	}
-	uint32_t fb = s.osdFb;
+	uint32_t fb = s.canvas.fd >= 0 ? s.canvas.fb : s.osdFb;
 	if (primary && !fb)
 	{
 		drmModeFBPtr old = drmModeGetFB(s.fd, currentFb);
@@ -206,7 +340,7 @@ inline bool histbDrmSetMode(const drmModeModeInfo &mode)
 	drmModeAtomicReqPtr req = drmModeAtomicAlloc(), rollback = drmModeAtomicAlloc();
 	bool ok = primary && fb && req && rollback &&
 		drmModeCreatePropertyBlob(s.fd, &mode, sizeof(mode), &blob) == 0 &&
-		drmModeCreatePropertyBlob(s.fd, &before->mode, sizeof(before->mode), &previousBlob) == 0;
+		(!before->mode_valid || drmModeCreatePropertyBlob(s.fd, &before->mode, sizeof(before->mode), &previousBlob) == 0);
 	auto add = [&](uint32_t obj, uint32_t type, const char *name, uint64_t value) {
 		uint64_t old = 0;
 		uint32_t id = histbDrmProperty(s.fd, obj, type, name, &old);
@@ -240,7 +374,7 @@ inline bool histbDrmSetMode(const drmModeModeInfo &mode)
 				if (p->formats[j] == DRM_FORMAT_ARGB8888 || p->formats[j] == DRM_FORMAT_XRGB8888) graphics = true;
 			/* Keep every source/crop/buffer unchanged. V1 has no scaler: the
 			 * kernel must reject a destination resize it cannot implement. */
-			if (!graphics)
+			if (!graphics && before->mode_valid)
 			{
 				const char *names[] = {"CRTC_X", "CRTC_Y", "CRTC_W", "CRTC_H"};
 				for (int j = 0; j < 4 && ok; ++j)
@@ -276,7 +410,7 @@ inline bool histbDrmSetMode(const drmModeModeInfo &mode)
 			if (drmModeAtomicCommit(s.fd, rollback, DRM_MODE_ATOMIC_ALLOW_MODESET, nullptr) != 0)
 			{
 				// Retain the alias if it might still be bound: RMFB would blank it.
-				s.osdFb = fb;
+				s.osdFb = fb; s.primary = primary;
 				eWarning("[histb-drm] KMS rollback failed: %s", strerror(errno));
 			}
 			else s.refreshPeriodUs = histbDrmModePeriodUs(before->mode);
@@ -293,41 +427,74 @@ inline bool histbDrmSetMode(const drmModeModeInfo &mode)
 	if (rollback) drmModeAtomicFree(rollback);
 	if (blob) drmModeDestroyPropertyBlob(s.fd, blob);
 	if (previousBlob) drmModeDestroyPropertyBlob(s.fd, previousBlob);
-	if (fb && fb != s.osdFb) drmModeRmFB(s.fd, fb);
+	if (fb && fb != s.osdFb && fb != s.canvas.fb) drmModeRmFB(s.fd, fb);
 	drmModeFreePlaneResources(planes);
 	drmModeFreeCrtc(before);
 	return ok;
 }
 
-/* The caller validates the real fbdev backing before accepting a canvas.
+/* Register the exact mapped backing, whether fbdev or the offscreen GEM.
  * No HDMI sink defers presentation only; connected commit errors still fail. */
-inline bool histbOsdSetGeometry(uint32_t width, uint32_t height)
+inline bool histbOsdSetGeometry(uint32_t width, uint32_t height,
+	uint32_t backingWidth, uint32_t backingHeight, uint32_t pitch)
 {
 	auto &s = histbDrmSession();
 	std::lock_guard<std::mutex> lock(s.mutex);
+	if (!width || !height || width > backingWidth || height > backingHeight || uint64_t(pitch) < uint64_t(backingWidth) * 4 ||
+		(s.canvas.fd >= 0 && (backingWidth != s.canvas.width || backingHeight != s.canvas.height || pitch != s.canvas.pitch)))
+		return false;
+	uint32_t oldW = s.sourceW, oldH = s.sourceH;
+	uint32_t oldBackingW = s.framebufferW, oldBackingH = s.framebufferH, oldPitch = s.sourcePitch;
+	s.sourceW = width; s.sourceH = height;
+	s.framebufferW = backingWidth; s.framebufferH = backingHeight; s.sourcePitch = pitch;
 	drmModeConnection connection;
 	int fd = histbDrmOpen(&connection);
 	if (connection == DRM_MODE_DISCONNECTED)
 	{
-		s.sourceW = width; s.sourceH = height;
-		eDebug("[histb-drm] HDMI disconnected; framebuffer canvas %ux%u remains available without an active output", width, height);
+		eDebug("[histb-drm] HDMI disconnected; real OSD canvas %ux%u remains available without an active output", width, height);
 		return true;
 	}
-	if (fd < 0 || connection != DRM_MODE_CONNECTED) return false;
-	drmModeCrtcPtr crtc = drmModeGetCrtc(s.fd, s.crtc);
-	if (!crtc || !crtc->mode_valid) { if (crtc) drmModeFreeCrtc(crtc); return false; }
-	uint32_t oldW = s.sourceW, oldH = s.sourceH;
-	s.sourceW = width; s.sourceH = height;
-	bool ok = histbDrmSetMode(crtc->mode);
-	if (!ok) { s.sourceW = oldW; s.sourceH = oldH; }
-	drmModeFreeCrtc(crtc);
+	bool ok = false;
+	if (fd >= 0 && connection == DRM_MODE_CONNECTED)
+	{
+		drmModeCrtcPtr crtc = drmModeGetCrtc(s.fd, s.crtc);
+		if (crtc && crtc->mode_valid) ok = histbDrmSetMode(crtc->mode);
+		else if (crtc && s.canvas.fd >= 0)
+		{
+			/* A first real connection need not have an fbdev CRTC yet. Use
+			 * only a timing actually advertised by that connected sink. */
+			drmModeConnectorPtr connector = drmModeGetConnector(s.fd, s.connector);
+			uint64_t edid = 0;
+			if (connector && connector->connection == DRM_MODE_CONNECTED && connector->count_modes &&
+				histbDrmProperty(s.fd, connector->connector_id, DRM_MODE_OBJECT_CONNECTOR, "EDID", &edid) && edid)
+			{
+				int preferred = 0;
+				for (int i = 0; i < connector->count_modes; ++i)
+					if (connector->modes[i].type & DRM_MODE_TYPE_PREFERRED) { preferred = i; break; }
+				ok = histbDrmSetMode(connector->modes[preferred]);
+			}
+			if (connector) drmModeFreeConnector(connector);
+		}
+		if (crtc) drmModeFreeCrtc(crtc);
+	}
+	if (!ok)
+	{
+		s.sourceW = oldW; s.sourceH = oldH;
+		s.framebufferW = oldBackingW; s.framebufferH = oldBackingH; s.sourcePitch = oldPitch;
+	}
 	return ok;
 }
 
 inline bool histbEnsureOsd()
 {
 	auto &s = histbDrmSession();
-	if (s.osdFb) return true;
+	if (s.osdFb && s.primary)
+	{
+		drmModePlanePtr plane = drmModeGetPlane(s.fd, s.primary);
+		bool bound = plane && plane->crtc_id == s.crtc && plane->fb_id == s.osdFb;
+		if (plane) drmModeFreePlane(plane);
+		if (bound) return true;
+	}
 	drmModeCrtcPtr crtc = drmModeGetCrtc(s.fd, s.crtc);
 	if (!crtc) return false;
 	bool ok = crtc->mode_valid && histbDrmSetMode(crtc->mode);
