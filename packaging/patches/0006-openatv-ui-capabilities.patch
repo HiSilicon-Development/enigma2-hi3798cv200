@@ -36,19 +36,18 @@ index 656b83a..98b1d6a 100644
  			</menu>
  			<!-- Menu / Setup / Network -->
 diff --git a/data/setup.xml b/data/setup.xml
-index ecd783c..483f912 100644
 --- a/data/setup.xml
 +++ b/data/setup.xml
-@@ -149,7 +149,7 @@
- 		<item level="0" text="DVB CI Delay" description="Set DVB CI delay." requires="CommonInterfaceCIDelay">config.cimisc.dvbCiDelay</item>
- 		<item level="0" text="CI Boot Delay" description="Set CI Boot delay.">config.cimisc.bootDelay</item>
+@@ -185,7 +185,7 @@
+ 			<item level="0" text="Time separator" description="Select the separator between the time elements." indent="1">config.usage.time.separator</item>
+ 		</if>
  	</setup>
 -	<setup key="Display" title="Display Settings" showOpenWebif="yes">
 +	<setup key="Display" title="Display Settings" showOpenWebif="yes" requires="DisplaySetup">
  		<item level="0" text="Brightness And Contrast" />
  		<item level="0" text="Clone TV screen to LCD" description="Shows live TV or informations on LCD." requires="FBLCDDisplay" indent="1">config.lcd.fblcddisplay</item>
  		<item level="0" text="Brightness (Normal)" description="Configure the brightness level of the front panel display for normal operation." indent="1">config.lcd.bright</item>
-@@ -617,7 +617,7 @@
+@@ -650,7 +650,7 @@
  			<item level="0" text="Enable debug log" description="If enabled, a log will be kept of CEC protocol traffic. The log files are located with the other log files but named 'Enigma2-hdmicec-[date].log'." indent="1">config.hdmicec.debug</item>
  		</if>
  	</setup>
@@ -57,7 +56,7 @@ index ecd783c..483f912 100644
  		<item level="0" text="Bitrate" description="Set the bitrate of the video encoder. Larger values improve the quality and also increases the file size.">config.hdmirecord.bitrate</item>
  		<item level="0" text="Width" description="The width of the picture. The input will be scaled to match this value.">config.hdmirecord.width</item>
  		<item level="0" text="Height" description="The height of the picture. The input will be scaled to match this value.">config.hdmirecord.height</item>
-@@ -635,7 +635,7 @@
+@@ -668,7 +668,7 @@
  	<setup key="Keyboard" title="Keyboard Settings" showOpenWebif="yes">
  		<item level="0" text="Keyboard" description="Select the type of keyboard connected to the %s %s.">config.inputDevices.keyboardsIndex</item>
  	</setup>
@@ -67,10 +66,9 @@ index ecd783c..483f912 100644
  		<item level="1" text="LED Running brightness" description="Select the brightness of the front panel LED when the receiver is Running.">config.fp.led.default_brightness</item>
  		<item level="1" text="LED Standby color" description="Select the color of the front panel power LED when the receiver is in Standby. This option also allows the LED to be deactivated/turned off.">config.fp.led.standby_color</item>
 diff --git a/lib/python/Components/ConfigList.py b/lib/python/Components/ConfigList.py
-index ecf5045..af9d5d4 100644
 --- a/lib/python/Components/ConfigList.py
 +++ b/lib/python/Components/ConfigList.py
-@@ -481,9 +481,13 @@ class ConfigListScreen:
+@@ -481,9 +481,13 @@
  		self["config"].handleKey(ActionKeys.NUMBER_0 + number, self.entryChanged)
  
  	def keySave(self):
@@ -87,7 +85,7 @@ index ecf5045..af9d5d4 100644
  		if quitData:
  			self.session.openWithCallback(boundFunction(self.restartConfirm, quitValue=quitData[0]), MessageBox, quitData[1], default=True, type=MessageBox.TYPE_YESNO)
  		else:
-@@ -494,18 +498,29 @@ class ConfigListScreen:
+@@ -494,18 +498,29 @@
  			self.session.open(TryQuitMainloop, retvalue=quitValue)
  			self.close()
  
@@ -121,16 +119,16 @@ index ecf5045..af9d5d4 100644
  		return quitData
  
  	def addSaveNotifier(self, notifier):
-@@ -528,7 +543,7 @@ class ConfigListScreen:
- 		self.closeConfigList((True,))
+@@ -529,7 +544,7 @@
  
  	def closeConfigList(self, closeParameters=()):
+ 		self.closeParameters = closeParameters
 -		if self["config"].isChanged():
 +		if any(item[1].isChanged() for item in self.getConfigList() if len(item) > 1):
- 			self.closeParameters = closeParameters
  			self.session.openWithCallback(self.cancelConfirm, MessageBox, self.cancelMsg, default=False, type=MessageBox.TYPE_YESNO)
  		else:
-@@ -537,7 +552,7 @@ class ConfigListScreen:
+ 			self.cancelConfirmed()
+@@ -537,7 +552,7 @@
  	def cancelConfirm(self, result):
  		if not result:
  			return
@@ -1190,40 +1188,55 @@ index 779907a..02ee6ff 100644
  			open("/etc/.restore_skins", "w").close()
  			from skin import reloadSkins
  			reloadSkins()
-diff --git a/lib/python/Screens/Time.py b/lib/python/Screens/Time.py
-index f9be46c..6978c54 100644
---- a/lib/python/Screens/Time.py
-+++ b/lib/python/Screens/Time.py
-@@ -2,6 +2,7 @@ from Components.ActionMap import HelpableActionMap
- from Components.config import config
+diff --git a/lib/python/Screens/DateTime.py b/lib/python/Screens/DateTime.py
+--- a/lib/python/Screens/DateTime.py
++++ b/lib/python/Screens/DateTime.py
+@@ -3,6 +3,7 @@
+ from Components.DateTimes import dateTimes
  from Components.NetworkTime import ntpSyncPoller
  from Components.Sources.StaticText import StaticText
 +from Screens.MessageBox import MessageBox
  from Screens.Setup import Setup
  from Tools.Geolocation import geolocation
  
-@@ -9,17 +10,76 @@ from Tools.Geolocation import geolocation
- class Time(Setup):
- 	def __init__(self, session):
- 		Setup.__init__(self, session=session, setup="Time")
--		self.addSaveNotifier(self.updateNetworkTime)
+@@ -23,14 +24,19 @@
+ 			dateTimes.updateDatesAndTimes()
+ 
+ 		Setup.__init__(self, session=session, setup="DateTime")
 +		self.originalTimeSettings = ntpSyncPoller.getSettings()
 +		self.timeSettingsTouched = False
 +		self.applyingTimeSettings = False
-+		if not ntpSyncPoller.isDebian:
-+			self.addSaveNotifier(self.updateNetworkTime)
  		self["key_yellow"] = StaticText()
  		self["geolocationActions"] = HelpableActionMap(self, "ColorActions", {
  			"yellow": (self.keyUseGeolocation, _("Use geolocation to set the current time zone location"))
- 		}, prio=0, description=_("Time Setup Actions"))
+ 		}, prio=0, description=_("Date and Time Setup Actions"))
 +		self.actionMaps.append("geolocationActions")
+ 		self.configElements = dateTimes.getConfigElements()
+ 		for configElement in self.configElements:
+ 			configElement.addNotifier(updatePreviews, initial_call=False)
+-		self.addSaveNotifier(updateNetworkTime)
++		if not ntpSyncPoller.isDebian:
++			self.addSaveNotifier(updateNetworkTime)
+ 		updatePreviews(None)
  		self.selectionChanged()
+ 		self.onClose.append(removeNotifiers)
+@@ -46,10 +52,70 @@
+ 		if Setup.getCurrentItem(self) in self.configElements:
+ 			self.setFootnote(f"{_("Preview")}:  {dateTimes.getDateTime()}")
  
- 	def updateNetworkTime(self):
- 		if config.misc.SyncTimeUsing.isChanged() or config.misc.NTPserver.isChanged() or config.misc.useNTPminutes.isChanged():
- 			ntpSyncPoller.timeCheck()
- 
-+	def keySave(self):
++	def getConfigList(self):
++		items = Setup.getConfigList(self)
++		# Hidden formatting controls belong to the same save/cancel transaction,
++		# including rollback of saved_value if writing the settings fails.
++		for label, configElement in ((_("Day separator"), config.usage.date.daySeparator), (_("Meridiem (AM/PM) display"), config.usage.time.meridiemFormat)):
++			if not any(len(item) > 1 and item[1] is configElement for item in items):
++				items.append((label, configElement))
++		return items
++
+ 	def keySave(self):
+-		config.usage.date.daySeparator.save()  # Save this value in case it is hidden.
+-		config.usage.time.meridiemFormat.save()  # Save this value in case it is hidden.
+-		Setup.keySave(self)
 +		if self.applyingTimeSettings:
 +			return
 +		if not ntpSyncPoller.isDebian:
@@ -1237,12 +1250,12 @@ index f9be46c..6978c54 100644
 +		def applied(error):
 +			self.applyingTimeSettings = False
 +			self.resumeAllActionMaps()
-+			self.setFootnote("")
++			self.selectionChanged()
 +			if error:
 +				self.session.open(MessageBox, _("Unable to apply time settings: %s") % error, type=MessageBox.TYPE_ERROR)
 +			else:
-+				# Do not change saved_value before OS application succeeds.  Setup
-+				# also preserves the cancel target if writing settings fails.
++				# Only commit config after the backend succeeds. Setup preserves
++				# the cancel target if writing the settings then fails.
 +				Setup.keySave(self)
 +
 +		ntpSyncPoller.applySettings(ntpSyncPoller.getSettings(), applied)
@@ -1257,6 +1270,8 @@ index f9be46c..6978c54 100644
 +			Setup.closeConfigList(self, closeParameters)
 +
 +	def cancelConfirm(self, result):
++		if self.applyingTimeSettings:
++			return
 +		if not result or not self.timeSettingsTouched:
 +			Setup.cancelConfirm(self, result)
 +			return
@@ -1267,16 +1282,15 @@ index f9be46c..6978c54 100644
 +		def restored(error):
 +			self.applyingTimeSettings = False
 +			self.resumeAllActionMaps()
-+			self.setFootnote("")
++			self.selectionChanged()
 +			if error:
-+				# Cancel still restores the user's configuration when the OS is
-+				# unavailable, but never hides a failed backend restoration.
++				# Still discard edits if the OS is unavailable, but show the
++				# restoration failure before closing the screen.
 +				self.session.openWithCallback(lambda answer: Setup.cancelConfirm(self, True), MessageBox, _("Unable to restore previous time settings: %s") % error, type=MessageBox.TYPE_ERROR)
 +			else:
 +				Setup.cancelConfirm(self, True)
 +
 +		ntpSyncPoller.applySettings(self.originalTimeSettings, restored)
-+
- 	def selectionChanged(self):
- 		if Setup.getCurrentItem(self) in (config.timezone.area, config.timezone.val):
- 			self["key_yellow"].setText(_("Use Geolocation"))
+ 
+ 	def cancelConfirmed(self):
+ 		config.usage.date.daySeparator.cancel()  # Cancel any changes to this value in case it is hidden.

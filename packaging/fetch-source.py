@@ -19,7 +19,7 @@ import urllib.request
 
 
 SOURCES = {
-    "enigma2": ("openatv/enigma2", "master"),
+    "enigma2": ("openatv/enigma2", "a6db04f56fd3314f9c3c30df639a4a394b6332c1"),
     "libdvbsi": ("OpenVisionE2/libdvbsi", "HEAD"),
     "tuxtxt": ("oe-alliance/tuxtxt", "HEAD"),
     "tuxbox-headers": ("OpenPLi/OpenPLi-1", "master"),
