@@ -64,6 +64,13 @@ CI 使用 `ubuntu-24.04-arm` 原生 runner，分别在 Debian 12 / 13 容器中�
 内核与刷机包的上游参考来源为
 [HiSilicon-Development/firmware](https://github.com/HiSilicon-Development/firmware) releases。
 
+### 视频入口回归检查
+
+`packaging/tests/test-video-entry.cpp` 直接测试解码后端使用的 `histbVideoEntryPoint()`，
+覆盖 AUD / SEI / extension 后的合法入口、普通依赖帧和截断 / 空数据，防止换台时一直
+等待入口或错误接收依赖帧。它是开发期回归测试，不随应用包安装；目前需使用 C++17
+编译器和 FFmpeg 开发头文件手动编译运行，尚未接入 CI。
+
 ## 维护中的补丁与 Web 资源
 
 `.ci/patches/220-maintained-source-patches.py` 在后端安装之后、procfs 隔离和 configure 之前，
@@ -216,14 +223,12 @@ HiSTB 软件 PCM 音量按百分比生成 Q16 增益：50% 为 0.5，0 / 静音�
 不额外增益或削波。PCM RUNNING、寄存器门控正确或非零样本都不能单独证明 HDMI 实际出声、
 连续无爆音或口型同步，必须使用真实接收端验收。
 
-## 固件来源与可选 OSCam
+## 系统固件与可选 OSCam
 
-`packaging/firmware/hisilicon/` 包含 `histb-avsp.bin`、`histb-h264-cabac.bin` 和
-`histb-hevc-cabac.bin` 三个生成文件，打包副本与配套内核生成的规范字节保持一致。
-这些文件的来源说明保留在同目录已有的 `README.avsp` / `README.cabac` 中。
-字节一致性只说明来源对应，不构成新的许可或再分发授权；不能由“生成文件”或本工程公开
-推导对所有上游材料的发布权。发布者仍须核对各来源的版权、许可和再分发条件。
-其他设备固件、内核驱动及 HiVXE FFmpeg 由外部运行环境提供和管理，应用包不替代其维护责任。
+解码固件由配套系统镜像 / 内核提供，应用仓库不再保留固件副本，Enigma2 应用包也不安装
+或覆盖固件。其他设备固件、内核驱动及 HiVXE FFmpeg 同样由外部运行环境提供和管理。
+打包器拒绝包含 `/lib/firmware/hisilicon` 或 `/usr/lib/firmware/hisilicon` 的暂存目录，
+避免应用升级覆盖系统固件；固件更新应随配套系统 / 内核维护。
 
 OSCam 是可选的独立运行服务，不是验证未加扰 DVB 播放的前提。Softcam 设置对接真实
 `oscam.service`，异步 start / restart 后检查 is-active，再保存 / 关闭；不创建假 init 脚本，
